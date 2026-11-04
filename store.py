@@ -63,7 +63,7 @@ class Store:
         CREATE TABLE IF NOT EXISTS tasks(
           id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL REFERENCES projects(id),
           name TEXT NOT NULL COLLATE NOCASE, budget INTEGER NOT NULL CHECK(budget>=0),
-          UNIQUE(project_id,name));
+          done INTEGER NOT NULL DEFAULT 0, UNIQUE(project_id,name));
         CREATE TABLE IF NOT EXISTS sessions(
           id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL REFERENCES tasks(id),
           allocated INTEGER NOT NULL CHECK(allocated>=0), elapsed REAL NOT NULL DEFAULT 0,
@@ -72,6 +72,9 @@ class Store:
         UPDATE sessions SET state='paused' WHERE state='running';
         INSERT OR IGNORE INTO categories(name) VALUES ('Main');
         ''')
+        if 'done' not in {r['name'] for r in self.db.execute('PRAGMA table_info(tasks)')}:
+            with self.db:  # Databases from before completed tasks existed.
+                self.db.execute('ALTER TABLE tasks ADD COLUMN done INTEGER NOT NULL DEFAULT 0')
         self.project('Main', '')
 
     def categories(self):
@@ -98,7 +101,8 @@ class Store:
         with self.db:
             row = self.db.execute('SELECT id FROM tasks WHERE project_id=? AND name=? COLLATE NOCASE', (pid, name.strip())).fetchone()
             if row:
-                tid = row[0]  # An existing task retains its shared budget.
+                tid = row[0]  # An existing task retains its shared budget; a new session reopens it.
+                self.db.execute('UPDATE tasks SET done=0 WHERE id=?', (tid,))
             else:
                 tid = self.db.execute('INSERT INTO tasks(project_id,name,budget) VALUES (?,?,?)', (pid, name.strip(), budget)).lastrowid
         self.new_session(tid, allocated, start)
@@ -159,6 +163,14 @@ class Store:
                     self.db.execute('UPDATE sessions SET allocated=? WHERE id=(SELECT MAX(id) FROM sessions WHERE task_id=?)', (allocated,tid))
         except sqlite3.IntegrityError:
             raise ValueError('That project already has a task with this name. Choose another name.') from None
+
+    def set_done(self, tid, done=True):
+        """Marking done finishes the task's open session; reopening keeps every session."""
+        if done:
+            sid = self.db.execute('SELECT MAX(id) FROM sessions WHERE task_id=?', (tid,)).fetchone()[0]
+            self.transition(sid, 'stopped')
+        with self.db:
+            self.db.execute('UPDATE tasks SET done=? WHERE id=?', (int(done), tid))
 
     def sessions(self, tid):
         """Sessions oldest first; `started` is the local start time."""

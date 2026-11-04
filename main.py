@@ -169,15 +169,22 @@ class TaskDialog(QDialog):
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(lambda: self.save(parent.store, row))
         buttons.rejected.connect(self.reject)
+        if row:
+            done = not row['done']
+            tip = 'Save, finish any open session, and move to Done' if done else 'Save and move back to the active list'
+            self.done_button = button('Mark done' if done else 'Reopen', lambda: self.save(parent.store, row, done), tip)
+            buttons.addButton(self.done_button, QDialogButtonBox.ButtonRole.ActionRole)
         layout.addWidget(buttons)
 
-    def save(self, store, row):
+    def save(self, store, row, done=None):
         try:
             if row:
                 values, corrections = self.form.values(), self.sessions.corrections()
                 store.edit(row['id'], *values)
                 for correction in corrections:
                     store.correct(*correction)
+                if done is not None:
+                    store.set_done(row['id'], done)
             else:
                 store.add(*self.form.values(), start=self.form.start.isChecked())
             self.accept()
@@ -212,7 +219,8 @@ class TaskRow(QFrame):
             b.setStyleSheet(f'QPushButton {{ border-radius: 14px; padding: 0; color: {color}; }}')
             setattr(self, action, b)
             heading.addWidget(b)
-        heading.addWidget(button('+', lambda: owner.new_session(self.row), 'Start a new session for this task'))
+        self.plus = button('+', lambda: owner.new_session(self.row), 'Start a new session for this task')
+        heading.addWidget(self.plus)
         box.addLayout(heading)
         metrics = QHBoxLayout()
         self.metrics = {}
@@ -235,7 +243,9 @@ class TaskRow(QFrame):
         self.row = row
         self.path.setText(f"{row['category']}  /  {row['project']}")
         self.title.setText(row['name'])
-        self.state.setText(f"{row['state'].upper()} · #{row['session_count']}")
+        self.state.setText(f"{'DONE' if row['done'] else row['state'].upper()} · #{row['session_count']}")
+        for control in (self.stopped, self.paused, self.running, self.plus):
+            control.setVisible(not row['done'])  # Reopen from Edit to track more time.
         for key, value in self.metrics.items():
             value.setText('—' if key in ('budget','allocated') and row[key] == 0 else clock(row[key]))
         for actual, limit in [('total','budget'), ('elapsed','allocated')]:
@@ -289,7 +299,7 @@ class ConfigDialog(QDialog):
                 p = QTreeWidgetItem(c,[project['name'],clock(sum(t['total'] for t in pt)),clock(sum(t['budget'] for t in pt))])
                 p.setData(0,Qt.ItemDataRole.UserRole,('projects',project['id']))
                 for task in pt:
-                    t = QTreeWidgetItem(p,[task['name'],clock(task['total']),clock(task['budget']) if task['budget'] else 'No limit'])
+                    t = QTreeWidgetItem(p,[task['name']+(' · done' if task['done'] else ''),clock(task['total']),clock(task['budget']) if task['budget'] else 'No limit'])
                     for n, s in enumerate(self.store.sessions(task['id']),1):
                         QTreeWidgetItem(t,[f"#{n} · {s['started']} · {s['state']}",clock(s['elapsed']),clock(s['allocated']) if s['allocated'] else 'No limit'])
             c.setExpanded(True)
@@ -456,6 +466,17 @@ class MainWindow(QMainWindow):
         self.empty = label('Your next session starts here.\n\nQuick add a task, or press Shift+A.','muted')
         self.empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.list.addWidget(self.empty)
+        self.active = QVBoxLayout()
+        self.active.setSpacing(8)
+        self.list.addLayout(self.active)
+        self.done_toggle = button('',self.toggle_done,'Show or hide completed tasks')
+        self.done_toggle.setStyleSheet('QPushButton { text-align: left; background: transparent; border: none; color: #91a1af; }')
+        self.list.addWidget(self.done_toggle)
+        self.done = QWidget()
+        self.done_list = QVBoxLayout(self.done)
+        self.done_list.setContentsMargins(0,0,0,0)
+        self.done_list.setSpacing(8)
+        self.list.addWidget(self.done)
         self.list.addStretch()
         self.scroll.setWidget(content)
         box.addWidget(self.scroll,1)
@@ -490,16 +511,31 @@ class MainWindow(QMainWindow):
 
     def refresh(self):
         tasks = self.store.tasks()
-        self.empty.setVisible(not tasks and self.inline is None)
-        for row in tasks:
-            if row['id'] not in self.cards:
-                card = TaskRow(self,row)
-                self.cards[row['id']] = card
-                self.list.insertWidget(self.list.count()-1,card)
-            else:
-                self.cards[row['id']].refresh(row)
+        active = [t for t in tasks if not t['done']]
+        done = [t for t in tasks if t['done']]
+        self.empty.setVisible(not active and self.inline is None)
+        for layout, rows in [(self.active,active),(self.done_list,done)]:
+            for index, row in enumerate(rows):
+                card = self.cards.get(row['id'])
+                if card is None:
+                    card = self.cards[row['id']] = TaskRow(self,row)
+                else:
+                    card.refresh(row)
+                if layout.indexOf(card) != index:  # New, or moved between active and Done.
+                    self.active.removeWidget(card)
+                    self.done_list.removeWidget(card)
+                    layout.insertWidget(index,card)
+        expanded = self.settings.value('done_expanded',False,type=bool)
+        self.done_toggle.setText(f"{'▾' if expanded else '▸'}  Done ({len(done)})")
+        self.done_toggle.setVisible(bool(done))
+        self.done.setVisible(bool(done) and expanded)
         running = next((t['name'] for t in tasks if t['state']=='running'),None)
-        self.summary.setText(f"{len(tasks)} tasks · {clock(sum(t['total'] for t in tasks))} tracked" + (' · Timer running' if running else ' · Timers idle'))
+        self.summary.setText(f"{len(active)} tasks" + (f" · {len(done)} done" if done else '') +
+                             f" · {clock(sum(t['total'] for t in tasks))} tracked" + (' · Timer running' if running else ' · Timers idle'))
+
+    def toggle_done(self):
+        self.settings.setValue('done_expanded',not self.settings.value('done_expanded',False,type=bool))
+        self.refresh()
 
     def quick_add(self):
         TaskDialog(self).exec()

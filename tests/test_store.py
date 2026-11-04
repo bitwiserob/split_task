@@ -1,4 +1,5 @@
 import io
+import sqlite3
 import tempfile
 import unittest
 from datetime import datetime
@@ -123,6 +124,51 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(lines[0],'Date,Category,Project,Task,Sessions,Tracked Time')
         self.assertEqual(len(lines),len(rows)+1)
         self.assertIn(f"{local('2026-03-02T12:00:00Z')},Work,Site,Copy,1,00:00:07",lines)
+
+    def test_mark_done_stops_timer_and_reopen_keeps_sessions(self):
+        tid = self.store.add('Work','A','Task',0,0)
+        self.time = 20
+        self.store.set_done(tid)
+        self.time = 90
+        self.store.checkpoint()
+        row = self.store.tasks()[0]
+        self.assertEqual((row['done'],row['state'],row['total']),(1,'stopped',20))
+        self.assertIsNone(self.store.active)
+        self.assertEqual(self.store.report('0000-01-01','9999-12-31')[0]['tracked'],20)
+        self.store.set_done(tid,False)
+        row = self.store.tasks()[0]
+        self.assertEqual((row['done'],row['session_count'],row['total']),(0,1,20))
+        self.store.set_done(tid)
+        self.store.add('Work','A','Task',0,0,False)  # Adding a session reopens it.
+        row = self.store.tasks()[0]
+        self.assertEqual((row['done'],row['session_count'],row['state']),(0,2,'paused'))
+
+    def test_migrates_database_without_done_column(self):
+        self.store.close()
+        old = Path(self.temp.name)/'old.db'
+        with sqlite3.connect(old) as db:
+            db.executescript('''
+            CREATE TABLE categories(id INTEGER PRIMARY KEY, name TEXT NOT NULL COLLATE NOCASE UNIQUE);
+            CREATE TABLE projects(id INTEGER PRIMARY KEY, category_id INTEGER NOT NULL REFERENCES categories(id),
+              name TEXT NOT NULL COLLATE NOCASE, UNIQUE(category_id,name));
+            CREATE TABLE tasks(id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL REFERENCES projects(id),
+              name TEXT NOT NULL COLLATE NOCASE, budget INTEGER NOT NULL CHECK(budget>=0), UNIQUE(project_id,name));
+            CREATE TABLE sessions(id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL REFERENCES tasks(id),
+              allocated INTEGER NOT NULL CHECK(allocated>=0), elapsed REAL NOT NULL DEFAULT 0,
+              state TEXT NOT NULL CHECK(state IN ('running','paused','stopped')),
+              created TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')));
+            INSERT INTO categories VALUES (1,'Work');
+            INSERT INTO projects VALUES (1,1,'Site');
+            INSERT INTO tasks VALUES (1,1,'Layout',600);
+            INSERT INTO sessions(task_id,allocated,elapsed,state) VALUES (1,300,42.5,'running');
+            ''')
+        db.close()
+        self.store = Store(old,lambda:self.time)
+        row = self.store.tasks()[0]
+        self.assertEqual((row['name'],row['budget'],row['total'],row['state'],row['done']),('Layout',600,42.5,'paused',0))
+        self.store.close()
+        self.store = Store(old,lambda:self.time)  # Reopening an already migrated database is a no-op.
+        self.assertEqual(self.store.tasks()[0]['done'],0)
 
     def test_duration_validation(self):
         self.assertEqual(duration('25'),1500)

@@ -29,6 +29,7 @@ To build a desktop executable, double-click `build_windows.bat` on Windows. The 
 - Adding the same task name under the same project/category (case-insensitive for ASCII names) adds a session and preserves the existing task budget. Edit changes that shared budget. Identically named tasks in different projects are separate.
 - **Edit:** change task name, category/project, and shared budget. Moving a task keeps all its session history. Renaming onto an existing task is rejected to avoid ambiguous merges.
 - **Session corrections:** Edit lists every session with its local start time, state, allocation, and elapsed time. Double-click an allocation or elapsed time to correct it; task totals update as soon as you save. A running session must be paused first (**Pause to correct**). Only the times you change are rewritten.
+- **Mark done:** in Edit, saves the dialog, finishes the task's open session (running or paused), and moves the task into the collapsible **Done** section at the bottom of the list. Done tasks keep every session and still appear in Config totals and Reports. **Reopen** (Edit on a done task) moves it back; start a new session with **+**. Adding a session to a done task by name also reopens it. **Stop** only finishes the current session — it never marks the task done.
 - **Reports:** a table with one row per task per day — Date, Category, Project, Task, Sessions, Tracked Time. Choose a From/To date range (inclusive, default the last seven days). Dates are local, and each session counts wholly on the day it started. **Export CSV…** saves exactly the rows shown (UTF-8, Excel-friendly).
 - **Config:** create/rename categories and projects, remove empty groups, inspect category/project/task totals and individual dated sessions, enable always-on-top, or back up the database. Project movement is done per task with Edit. Recorded tasks and sessions are retained; this version does not delete history.
 
@@ -46,7 +47,7 @@ Use **Config → Back up database** for a consistent SQLite backup. To restore, 
 python -m unittest discover -s tests -v
 ```
 
-Core tests cover pause/resume/stop, session corrections, daily reports and CSV export, duplicate task aggregation, one active timer, new sessions, crash recovery, editing/moving history, name collisions, and duration validation. A headless Qt smoke test and layout inspection were run on Linux using PySide6 6.8.3. Windows launcher and executable packaging still need validation on a Windows machine.
+Core tests cover pause/resume/stop, session corrections, daily reports and CSV export, mark done/reopen, schema migration, duplicate task aggregation, one active timer, new sessions, crash recovery, editing/moving history, name collisions, and duration validation. A headless Qt smoke test and layout inspection were run on Linux using PySide6 6.8.3. Windows launcher and executable packaging still need validation on a Windows machine.
 
 Source: `main.py` (UI), `store.py` (database and timing), `tests/test_store.py` (domain tests).
 
