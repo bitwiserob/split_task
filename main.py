@@ -5,13 +5,14 @@ import sys
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer, QStandardPaths, QSettings, QLockFile, QDate
-from PySide6.QtGui import QShortcut, QKeySequence
+from PySide6.QtGui import QShortcut, QKeySequence, QColor
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QScrollArea, QFrame, QDialog, QFormLayout, QLineEdit,
     QComboBox, QDialogButtonBox, QMessageBox, QCheckBox, QTreeWidget,
     QTreeWidgetItem, QInputDialog, QFileDialog, QTableWidget, QTableWidgetItem,
-    QHeaderView, QAbstractItemView, QDateEdit,
+    QHeaderView, QAbstractItemView, QDateEdit, QSplitter, QListWidget,
+    QListWidgetItem, QTextEdit,
 )
 from store import REPORT_COLUMNS, Store, clock, duration, report_csv
 
@@ -32,6 +33,10 @@ QPushButton#primary { background: #91e0b2; color: #10251a; border: none; font-we
 QLineEdit,QComboBox,QDateEdit { background: #10151b; border: 1px solid #435160; border-radius: 4px; padding: 7px; }
 QLineEdit:focus,QComboBox:focus,QDateEdit:focus { border-color: #91e0b2; }
 QScrollArea { border: none; }
+QListWidget,QTextEdit { background: #10151b; border: 1px solid #435160; border-radius: 4px; }
+QListWidget { alternate-background-color: #171d25; }
+QListWidget::item { padding: 4px; }
+QTextEdit:focus,QListWidget:focus { border-color: #91e0b2; }
 QTreeWidget,QTableWidget { border: 1px solid #36424e; alternate-background-color: #1c232c; gridline-color: #303b47; }
 QHeaderView::section { background: #27323d; color: #b4c1cc; border: none; padding: 8px; }
 QToolTip { background: #27323d; color: white; border: 1px solid #566879; }
@@ -193,11 +198,172 @@ class TaskDialog(QDialog):
             QMessageBox.warning(self, 'Check task', str(exc))
 
 
+class TaskDetails(QDialog):
+    """Double-click a task: its subtask checklist beside one note per session."""
+
+    def __init__(self, owner, row):
+        super().__init__(owner)
+        self.store, self.row = owner.store, row
+        self.loading, self.current, self.saved = False, None, ''
+        self.setWindowTitle(f"{row['name']} — subtasks & note")
+        self.resize(660, 430)
+        box = QVBoxLayout(self)
+        box.setSpacing(8)
+        head = QHBoxLayout()
+        head.addWidget(label(row['name'], 'taskName'), 1)
+        head.addWidget(label(f"{row['category']}  /  {row['project']}", 'muted'))
+        box.addLayout(head)
+        panes = QSplitter()
+        panes.addWidget(self.checklist())
+        panes.addWidget(self.notepad())
+        panes.setSizes([280, 380])
+        box.addWidget(panes, 1)
+        bottom = QHBoxLayout()
+        bottom.addWidget(label('Subtasks carry no time of their own; the task keeps the clock.', 'muted'), 1)
+        bottom.addWidget(button('Close', self.accept, primary=True))
+        box.addLayout(bottom)
+        self.populate()
+        self.load_note()
+
+    def checklist(self):
+        pane = QWidget()
+        box = QVBoxLayout(pane)
+        box.setContentsMargins(0, 0, 6, 0)
+        box.setSpacing(6)
+        box.addWidget(label('SUBTASKS', 'group'))
+        self.items = QListWidget()
+        self.items.setAlternatingRowColors(True)
+        self.items.setToolTip('Tick to complete, double-click to rename')
+        self.items.itemChanged.connect(self.changed)
+        box.addWidget(self.items, 1)
+        entry = QHBoxLayout()
+        self.entry = QLineEdit()
+        self.entry.setPlaceholderText('Add a subtask, then press Enter')
+        self.entry.returnPressed.connect(self.add)
+        entry.addWidget(self.entry, 1)
+        entry.addWidget(button('Add', self.add, 'Add this subtask to the checklist'))
+        box.addLayout(entry)
+        bar = QHBoxLayout()
+        self.progress = label('', 'muted')
+        bar.addWidget(self.progress, 1)
+        bar.addWidget(button('Delete', self.delete, 'Remove the selected subtask'))
+        box.addLayout(bar)
+        return pane
+
+    def notepad(self):
+        pane = QWidget()
+        box = QVBoxLayout(pane)
+        box.setContentsMargins(6, 0, 0, 0)
+        box.setSpacing(6)
+        box.addWidget(label('SESSION NOTE', 'group'))
+        self.sessions = QComboBox()
+        self.sessions.setToolTip('Every session keeps its own note')
+        for n, s in enumerate(self.store.sessions(self.row['id']), 1):
+            self.sessions.addItem(f"#{n} · {s['started']} · {s['state']}", s['id'])
+        self.sessions.setCurrentIndex(self.sessions.count() - 1)  # The session shown on the card.
+        self.sessions.currentIndexChanged.connect(self.load_note)
+        box.addWidget(self.sessions)
+        self.note = QTextEdit()
+        self.note.setAcceptRichText(False)
+        self.note.setPlaceholderText('What happened in this session?')
+        self.note.textChanged.connect(self.touched)
+        box.addWidget(self.note, 1)
+        bar = QHBoxLayout()
+        self.status = label('', 'muted')
+        bar.addWidget(self.status, 1)
+        self.save_button = button('Save note', self.save, 'Save this note on the selected session', True)
+        bar.addWidget(self.save_button)
+        box.addLayout(bar)
+        return pane
+
+    def populate(self):
+        self.loading = True  # setCheckState and setText both emit itemChanged.
+        self.items.clear()
+        rows = self.store.subtasks(self.row['id'])
+        for sub in rows:
+            item = QListWidgetItem(sub['name'])
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEditable)
+            item.setCheckState(Qt.CheckState.Checked if sub['done'] else Qt.CheckState.Unchecked)
+            item.setData(Qt.ItemDataRole.UserRole, (sub['id'], sub['name'], bool(sub['done'])))
+            if sub['done']:
+                font = item.font()
+                font.setStrikeOut(True)
+                item.setFont(font)
+                item.setForeground(QColor('#7f8c99'))
+            self.items.addItem(item)
+        self.loading = False
+        done = sum(1 for s in rows if s['done'])
+        self.progress.setText(f'{done} of {len(rows)} done' if rows else 'Nothing listed yet.')
+
+    def changed(self, item):
+        if self.loading:
+            return
+        sub_id, name, done = item.data(Qt.ItemDataRole.UserRole)
+        text, checked = item.text().strip(), item.checkState() == Qt.CheckState.Checked
+        try:
+            self.store.edit_subtask(sub_id, None if text == name else text, None if checked == done else checked)
+        except (ValueError, sqlite3.Error) as exc:
+            QMessageBox.warning(self, 'Check subtask', str(exc))
+        self.populate()
+
+    def add(self):
+        try:
+            self.store.add_subtask(self.row['id'], self.entry.text())
+            self.entry.clear()
+            self.populate()
+            self.items.scrollToBottom()
+        except (ValueError, sqlite3.Error) as exc:
+            QMessageBox.warning(self, 'Check subtask', str(exc))
+
+    def delete(self):
+        item = self.items.currentItem()
+        if item is None:
+            QMessageBox.information(self, 'Select a subtask', 'Select a subtask to delete first.')
+            return
+        self.store.delete_subtask(item.data(Qt.ItemDataRole.UserRole)[0])
+        self.populate()
+
+    def dirty(self):
+        return self.current is not None and self.note.toPlainText().strip() != self.saved
+
+    def touched(self):
+        self.status.setText('Unsaved changes' if self.dirty() else ('Saved' if self.saved else 'No note yet'))
+
+    def load_note(self):
+        if self.dirty() and QMessageBox.question(self, 'Unsaved note', 'Save the note you were editing?') == QMessageBox.StandardButton.Yes:
+            self.store.set_note(self.current, self.note.toPlainText())
+        self.current = self.sessions.currentData()
+        row = next((s for s in self.store.sessions(self.row['id']) if s['id'] == self.current), None)
+        self.saved = row['note'] if row else ''
+        self.note.setEnabled(row is not None)
+        self.save_button.setEnabled(row is not None)
+        self.note.setPlainText(self.saved)  # textChanged refreshes the status line.
+
+    def save(self):
+        if self.current is None:
+            return
+        self.store.set_note(self.current, self.note.toPlainText())
+        self.saved = self.note.toPlainText().strip()
+        self.status.setText('Note saved')
+
+    def done(self, result):
+        if self.dirty():
+            answer = QMessageBox.question(self, 'Unsaved note', 'Save this session note before closing?',
+                                          QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Discard
+                                          | QMessageBox.StandardButton.Cancel)
+            if answer == QMessageBox.StandardButton.Cancel:
+                return
+            if answer == QMessageBox.StandardButton.Save:
+                self.save()
+        super().done(result)
+
+
 class TaskRow(QFrame):
     def __init__(self, owner, row):
         super().__init__()
         self.owner, self.row = owner, row
         self.setObjectName('card')
+        self.setToolTip('Double-click for subtasks and this session\'s note')
         box = QVBoxLayout(self)
         box.setContentsMargins(10, 7, 10, 7)
         box.setSpacing(6)
@@ -236,6 +402,9 @@ class TaskRow(QFrame):
         box.addLayout(metrics)
         self.refresh(row)
 
+    def mouseDoubleClickEvent(self, event):
+        self.owner.details(self.row)
+
     def control(self, state):
         self.owner.store.transition(self.row['sid'], state)
         self.owner.refresh()
@@ -243,7 +412,9 @@ class TaskRow(QFrame):
     def refresh(self, row):
         self.row = row
         self.title.setText(row['name'])
-        self.state.setText(f"{'DONE' if row['done'] else row['state'].upper()} · #{row['session_count']}")
+        marks = f" · ✓{row['subtasks_done']}/{row['subtasks']}" if row['subtasks'] else ''
+        marks += ' · ✎' if row['note'] else ''  # This session has a note.
+        self.state.setText(f"{'DONE' if row['done'] else row['state'].upper()} · #{row['session_count']}{marks}")
         for control in (self.stopped, self.paused, self.running, self.plus):
             control.setVisible(not row['done'])  # Reopen from Edit to track more time.
         for key, value in self.metrics.items():
@@ -587,6 +758,10 @@ class MainWindow(QMainWindow):
 
     def edit(self,row):
         TaskDialog(self,row).exec()
+        self.refresh()
+
+    def details(self,row):
+        TaskDetails(self,row).exec()
         self.refresh()
 
     def new_session(self,row):

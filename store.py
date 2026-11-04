@@ -69,12 +69,20 @@ class Store:
           allocated INTEGER NOT NULL CHECK(allocated>=0), elapsed REAL NOT NULL DEFAULT 0,
           state TEXT NOT NULL CHECK(state IN ('running','paused','stopped')),
           created TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')));
+        CREATE TABLE IF NOT EXISTS subtasks(
+          id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL REFERENCES tasks(id),
+          name TEXT NOT NULL, done INTEGER NOT NULL DEFAULT 0,
+          created TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')));
+        CREATE INDEX IF NOT EXISTS subtasks_task ON subtasks(task_id);
         UPDATE sessions SET state='paused' WHERE state='running';
         INSERT OR IGNORE INTO categories(name) VALUES ('Main');
         ''')
         if 'done' not in {r['name'] for r in self.db.execute('PRAGMA table_info(tasks)')}:
             with self.db:  # Databases from before completed tasks existed.
                 self.db.execute('ALTER TABLE tasks ADD COLUMN done INTEGER NOT NULL DEFAULT 0')
+        if 'note' not in {r['name'] for r in self.db.execute('PRAGMA table_info(sessions)')}:
+            with self.db:  # Databases from before session notes existed.
+                self.db.execute("ALTER TABLE sessions ADD COLUMN note TEXT NOT NULL DEFAULT ''")
         self.project('Main', '')
 
     def categories(self):
@@ -143,7 +151,9 @@ class Store:
 
     def tasks(self):
         return self.db.execute('''SELECT t.*,p.name project,c.name category,
-          s.id sid,s.allocated,s.elapsed,s.state,
+          s.id sid,s.allocated,s.elapsed,s.state,s.note,
+          (SELECT COUNT(*) FROM subtasks WHERE task_id=t.id) subtasks,
+          (SELECT COUNT(*) FROM subtasks WHERE task_id=t.id AND done=1) subtasks_done,
           (SELECT COALESCE(SUM(elapsed),0) FROM sessions WHERE task_id=t.id) total,
           (SELECT COUNT(*) FROM sessions WHERE task_id=t.id) session_count
           FROM tasks t JOIN projects p ON p.id=t.project_id
@@ -185,6 +195,34 @@ class Store:
             self.transition(sid, 'paused')
         with self.db:
             self.db.execute('UPDATE sessions SET elapsed=?,allocated=? WHERE id=?', (elapsed, allocated, sid))
+
+    def subtasks(self, tid):
+        """The task's checklist, oldest first. Subtasks carry no time of their own."""
+        return self.db.execute('SELECT * FROM subtasks WHERE task_id=? ORDER BY id', (tid,)).fetchall()
+
+    def add_subtask(self, tid, name):
+        if not name.strip():
+            raise ValueError('Give the subtask a name.')
+        with self.db:
+            return self.db.execute('INSERT INTO subtasks(task_id,name) VALUES (?,?)', (tid, name.strip())).lastrowid
+
+    def edit_subtask(self, sub_id, name=None, done=None):
+        if name is not None and not name.strip():
+            raise ValueError('Give the subtask a name.')
+        with self.db:
+            if name is not None:
+                self.db.execute('UPDATE subtasks SET name=? WHERE id=?', (name.strip(), sub_id))
+            if done is not None:
+                self.db.execute('UPDATE subtasks SET done=? WHERE id=?', (int(done), sub_id))
+
+    def delete_subtask(self, sub_id):
+        with self.db:
+            self.db.execute('DELETE FROM subtasks WHERE id=?', (sub_id,))
+
+    def set_note(self, sid, note):
+        """One note per session; saving replaces it."""
+        with self.db:
+            self.db.execute('UPDATE sessions SET note=? WHERE id=?', (note.strip(), sid))
 
     def report(self, start, end):
         """Per-task daily totals for local ISO dates start..end inclusive.

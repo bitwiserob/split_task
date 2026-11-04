@@ -166,9 +166,55 @@ class StoreTests(unittest.TestCase):
         self.store = Store(old,lambda:self.time)
         row = self.store.tasks()[0]
         self.assertEqual((row['name'],row['budget'],row['total'],row['state'],row['done']),('Layout',600,42.5,'paused',0))
+        self.assertEqual((row['note'],row['subtasks']),('',0))
+        self.store.set_note(row['sid'],'Added after migrating')
+        self.store.add_subtask(row['id'],'Added after migrating')
         self.store.close()
         self.store = Store(old,lambda:self.time)  # Reopening an already migrated database is a no-op.
-        self.assertEqual(self.store.tasks()[0]['done'],0)
+        row = self.store.tasks()[0]
+        self.assertEqual((row['done'],row['note'],row['subtasks']),(0,'Added after migrating',1))
+
+    def test_subtasks_are_checklist_items_without_time(self):
+        tid = self.store.add('Work','A','Task',0,600)
+        other = self.store.add('Work','A','Other',0,600,False)
+        first = self.store.add_subtask(tid,'  Draft the copy  ')
+        second = self.store.add_subtask(tid,'Pick a hero image')
+        self.store.add_subtask(other,'Unrelated')
+        self.assertEqual([s['name'] for s in self.store.subtasks(tid)],['Draft the copy','Pick a hero image'])
+        self.store.edit_subtask(first,done=True)
+        self.store.edit_subtask(second,name='Pick the hero image')
+        row = self.store.tasks()[0]
+        self.assertEqual((row['subtasks'],row['subtasks_done']),(2,1))
+        self.time = 60  # Checklist edits never touch the clock.
+        self.store.checkpoint()
+        self.assertEqual(self.store.tasks()[0]['total'],60)
+        self.store.edit_subtask(first,done=False)
+        self.assertEqual(self.store.tasks()[0]['subtasks_done'],0)
+        self.store.delete_subtask(first)
+        self.assertEqual([s['name'] for s in self.store.subtasks(tid)],['Pick the hero image'])
+        self.assertEqual(self.store.tasks()[1]['subtasks'],1)  # Other tasks keep their own.
+        for blank in ['','   ']:
+            with self.assertRaises(ValueError):
+                self.store.add_subtask(tid,blank)
+            with self.assertRaises(ValueError):
+                self.store.edit_subtask(second,name=blank)
+
+    def test_one_note_per_session(self):
+        tid = self.store.add('Work','A','Task',0,600)
+        first = self.store.tasks()[0]['sid']
+        second = self.store.new_session(tid,600)
+        self.assertEqual([s['note'] for s in self.store.sessions(tid)],['',''])
+        self.assertEqual(self.store.tasks()[0]['note'],'')
+        self.store.set_note(first,'  Kick-off  ')
+        self.store.set_note(second,'Blocked on copy')
+        self.assertEqual([s['note'] for s in self.store.sessions(tid)],['Kick-off','Blocked on copy'])
+        self.assertEqual(self.store.tasks()[0]['note'],'Blocked on copy')  # The card shows the latest.
+        self.store.set_note(second,'Rewritten')
+        self.assertEqual(self.store.sessions(tid)[1]['note'],'Rewritten')
+        self.store.set_note(second,'')
+        self.assertEqual(self.store.tasks()[0]['note'],'')
+        self.store.correct(first,120,600)  # Corrections leave the note alone.
+        self.assertEqual(self.store.sessions(tid)[0]['note'],'Kick-off')
 
     def test_duration_validation(self):
         self.assertEqual(duration('25'),1500)
