@@ -27,8 +27,9 @@ To build a desktop executable, double-click `build_windows.bat` on Windows. The 
 - **Red square:** stop and finish the session. **Pause:** preserve it for later. **Green play:** resume a paused session. **+**: choose an allocation and immediately start a new session with the same task identity, finishing the prior session for that task.
 - Only one timer runs at once. Starting or resuming another task pauses the active task. New sessions can also be added paused by unchecking “Start timer immediately.”
 - Adding the same task name under the same project/category (case-insensitive for ASCII names) adds a session and preserves the existing task budget. Edit changes that shared budget. Identically named tasks in different projects are separate.
-- **Edit:** change task name, category/project, shared budget, and the latest session allocation. Moving a task keeps all its session history. Renaming onto an existing task is rejected to avoid ambiguous merges.
-- **Config:** create/rename categories and projects, remove empty groups, inspect category/project/task totals and individual dated sessions, enable always-on-top, or back up the database. Project movement is done per task with Edit. Recorded tasks and sessions are retained; this version does not delete history or manually adjust elapsed time.
+- **Edit:** change task name, category/project, and shared budget. Moving a task keeps all its session history. Renaming onto an existing task is rejected to avoid ambiguous merges.
+- **Session corrections:** Edit lists every session with its local start time, state, allocation, and elapsed time. Double-click an allocation or elapsed time to correct it; task totals update as soon as you save. A running session must be paused first (**Pause to correct**). Only the times you change are rewritten.
+- **Config:** create/rename categories and projects, remove empty groups, inspect category/project/task totals and individual dated sessions, enable always-on-top, or back up the database. Project movement is done per task with Edit. Recorded tasks and sessions are retained; this version does not delete history.
 
 ## Storage and timer behavior
 

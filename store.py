@@ -135,16 +135,32 @@ class Store:
           JOIN sessions s ON s.id=(SELECT MAX(id) FROM sessions WHERE task_id=t.id)
           ORDER BY t.id''').fetchall()
 
-    def edit(self, tid, category, project, name, budget, allocated):
+    def edit(self, tid, category, project, name, budget, allocated=None):
+        """Allocation, when given, applies to the latest session; use correct() for others."""
         if not name.strip():
             raise ValueError('Give the task a name.')
         pid = self.project(category, project)
         try:
             with self.db:
                 self.db.execute('UPDATE tasks SET project_id=?,name=?,budget=? WHERE id=?', (pid,name.strip(),budget,tid))
-                self.db.execute('UPDATE sessions SET allocated=? WHERE id=(SELECT MAX(id) FROM sessions WHERE task_id=?)', (allocated,tid))
+                if allocated is not None:
+                    self.db.execute('UPDATE sessions SET allocated=? WHERE id=(SELECT MAX(id) FROM sessions WHERE task_id=?)', (allocated,tid))
         except sqlite3.IntegrityError:
             raise ValueError('That project already has a task with this name. Choose another name.') from None
+
+    def sessions(self, tid):
+        """Sessions oldest first; `started` is the local start time."""
+        return self.db.execute('''SELECT *,datetime(created,'localtime') started
+            FROM sessions WHERE task_id=? ORDER BY id''', (tid,)).fetchall()
+
+    def correct(self, sid, elapsed, allocated):
+        """Overwrite a session's elapsed time and allocation, pausing it first if running."""
+        if elapsed < 0 or allocated < 0:
+            raise ValueError('Times cannot be negative.')
+        if self.active == sid:
+            self.transition(sid, 'paused')
+        with self.db:
+            self.db.execute('UPDATE sessions SET elapsed=?,allocated=? WHERE id=?', (elapsed, allocated, sid))
 
     def rename(self, kind, ident, name):
         if kind not in ('categories', 'projects') or not name.strip():

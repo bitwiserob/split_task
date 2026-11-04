@@ -10,7 +10,8 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QScrollArea, QFrame, QDialog, QFormLayout, QLineEdit,
     QComboBox, QDialogButtonBox, QMessageBox, QCheckBox, QTreeWidget,
-    QTreeWidgetItem, QInputDialog, QFileDialog,
+    QTreeWidgetItem, QInputDialog, QFileDialog, QTableWidget, QTableWidgetItem,
+    QHeaderView, QAbstractItemView,
 )
 from store import Store, clock, duration
 
@@ -30,7 +31,7 @@ QPushButton#primary { background: #91e0b2; color: #10251a; border: none; font-we
 QLineEdit,QComboBox { background: #10151b; border: 1px solid #435160; border-radius: 4px; padding: 7px; }
 QLineEdit:focus,QComboBox:focus { border-color: #91e0b2; }
 QScrollArea { border: none; }
-QTreeWidget { border: 1px solid #36424e; alternate-background-color: #1c232c; }
+QTreeWidget,QTableWidget { border: 1px solid #36424e; alternate-background-color: #1c232c; gridline-color: #303b47; }
 QHeaderView::section { background: #27323d; color: #b4c1cc; border: none; padding: 8px; }
 QToolTip { background: #27323d; color: white; border: 1px solid #566879; }
 '''
@@ -75,9 +76,11 @@ class TaskForm(QWidget):
         self.name.setPlaceholderText('What are you working on?')
         self.allocated = QLineEdit(clock(row['allocated']) if row else '25')
         self.budget = QLineEdit(clock(row['budget']) if row else '60')
-        for title, field in [('Category',self.category), ('Project',self.project),
-                             ('Task',self.name), ('Session allocation',self.allocated),
-                             ('Total task budget',self.budget)]:
+        self.editing = row is not None
+        fields = [('Category',self.category), ('Project',self.project), ('Task',self.name)]
+        if not self.editing:  # Edit corrects allocations per session instead.
+            fields.append(('Session allocation',self.allocated))
+        for title, field in fields + [('Total task budget',self.budget)]:
             form.addRow(title, field)
         form.addRow(label('Times: minutes or HH:MM:SS. Zero means no limit.', 'muted'))
         if not row:
@@ -97,17 +100,72 @@ class TaskForm(QWidget):
 
     def values(self):
         return (self.category.currentText(), self.project.currentText(), self.name.text(),
-                duration(self.budget.text()), duration(self.allocated.text()))
+                duration(self.budget.text()), None if self.editing else duration(self.allocated.text()))
+
+
+class SessionTable(QTableWidget):
+    """Editable allocation and elapsed time for each session of one task."""
+    COLUMNS = ['#', 'Started', 'State', 'Allocation', 'Elapsed']
+
+    def __init__(self, store, tid):
+        super().__init__(0, len(self.COLUMNS))
+        self.store, self.tid = store, tid
+        self.setHorizontalHeaderLabels(self.COLUMNS)
+        self.verticalHeader().hide()
+        self.setAlternatingRowColors(True)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        for col in (0, 1):
+            self.horizontalHeader().setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
+        self.sessions = store.sessions(tid)
+        self.setRowCount(len(self.sessions))
+        for n, s in enumerate(self.sessions):
+            self.fill(n, s)
+
+    def fill(self, n, s):
+        running = s['state'] == 'running'
+        for col, text in enumerate([str(n+1), s['started'], s['state'], clock(s['allocated']), clock(s['elapsed'])]):
+            item = QTableWidgetItem(text)
+            if col < 3 or running:
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            self.setItem(n, col, item)
+        if running:
+            self.setCellWidget(n, 2, button('Pause to correct', lambda checked=False: self.pause(n),
+                                            'Pause this session so its times can be corrected'))
+
+    def pause(self, n):
+        self.store.transition(self.sessions[n]['id'], 'paused')
+        self.removeCellWidget(n, 2)
+        self.sessions[n] = next(s for s in self.store.sessions(self.tid) if s['id'] == self.sessions[n]['id'])
+        self.fill(n, self.sessions[n])
+
+    def corrections(self):
+        """(sid, elapsed, allocated) for edited rows; untouched rows keep sub-second precision."""
+        changes = []
+        for n, s in enumerate(self.sessions):
+            allocated, elapsed = self.item(n, 3).text(), self.item(n, 4).text()
+            if allocated == clock(s['allocated']) and elapsed == clock(s['elapsed']):
+                continue
+            try:
+                changes.append((s['id'], duration(elapsed), duration(allocated)))
+            except ValueError as exc:
+                raise ValueError(f'Session #{n+1}: {exc}') from None
+        return changes
 
 
 class TaskDialog(QDialog):
     def __init__(self, parent, row=None):
         super().__init__(parent)
         self.setWindowTitle('Edit task' if row else 'Quick add')
-        self.resize(440, 330)
+        self.resize(*((560, 560) if row else (440, 330)))
         layout = QVBoxLayout(self)
         self.form = TaskForm(parent.store, row)
         layout.addWidget(self.form)
+        if row:
+            layout.addWidget(label('Sessions', 'taskName'))
+            layout.addWidget(label('Double-click an allocation or elapsed time to correct it. Pause a running session first.', 'muted'))
+            self.sessions = SessionTable(parent.store, row['id'])
+            layout.addWidget(self.sessions, 1)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(lambda: self.save(parent.store, row))
         buttons.rejected.connect(self.reject)
@@ -116,7 +174,10 @@ class TaskDialog(QDialog):
     def save(self, store, row):
         try:
             if row:
-                store.edit(row['id'], *self.form.values())
+                values, corrections = self.form.values(), self.sessions.corrections()
+                store.edit(row['id'], *values)
+                for correction in corrections:
+                    store.correct(*correction)
             else:
                 store.add(*self.form.values(), start=self.form.start.isChecked())
             self.accept()
@@ -229,9 +290,8 @@ class ConfigDialog(QDialog):
                 p.setData(0,Qt.ItemDataRole.UserRole,('projects',project['id']))
                 for task in pt:
                     t = QTreeWidgetItem(p,[task['name'],clock(task['total']),clock(task['budget']) if task['budget'] else 'No limit'])
-                    sessions = self.store.db.execute('SELECT * FROM sessions WHERE task_id=? ORDER BY id',(task['id'],)).fetchall()
-                    for n, s in enumerate(sessions,1):
-                        QTreeWidgetItem(t,[f"#{n} · {s['created']} · {s['state']}",clock(s['elapsed']),clock(s['allocated']) if s['allocated'] else 'No limit'])
+                    for n, s in enumerate(self.store.sessions(task['id']),1):
+                        QTreeWidgetItem(t,[f"#{n} · {s['started']} · {s['state']}",clock(s['elapsed']),clock(s['allocated']) if s['allocated'] else 'No limit'])
             c.setExpanded(True)
         self.tree.expandToDepth(1)
 

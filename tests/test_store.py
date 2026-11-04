@@ -73,6 +73,29 @@ class StoreTests(unittest.TestCase):
             self.store.edit(other,'Hobby','B','Renamed',50,10)
         self.assertEqual(self.store.tasks()[1]['name'],'Other')
 
+    def test_edit_without_allocation_keeps_sessions(self):
+        tid = self.store.add('Work','A','Task',100,20,False)
+        self.store.edit(tid,'Work','A','Task',300)
+        row = self.store.tasks()[0]
+        self.assertEqual((row['budget'],row['allocated']),(300,20))
+
+    def test_correct_pauses_running_session_and_updates_totals(self):
+        tid = self.store.add('Work','A','Task',0,600)
+        first = self.store.tasks()[0]['sid']
+        self.time = 30
+        second = self.store.new_session(tid,300)
+        self.time = 50
+        self.store.correct(second,120,900)
+        self.time = 500  # A paused session no longer accumulates.
+        self.store.checkpoint()
+        self.store.correct(first,45,600)
+        row = self.store.tasks()[0]
+        self.assertEqual((row['state'],row['elapsed'],row['allocated'],row['total']),('paused',120,900,165))
+        self.assertIsNone(self.store.active)
+        self.assertEqual([s['elapsed'] for s in self.store.sessions(tid)],[45,120])
+        with self.assertRaises(ValueError):
+            self.store.correct(first,-1,0)
+
     def test_duration_validation(self):
         self.assertEqual(duration('25'),1500)
         self.assertEqual(duration('01:02:03'),3723)
