@@ -20,7 +20,8 @@ STYLE = '''
 QWidget { background: #14191f; color: #e9eef3; font-family: 'Segoe UI'; font-size: 12px; }
 QLabel#brand { font-size: 20px; font-weight: 700; }
 QLabel#muted { color: #91a1af; font-size: 11px; }
-QLabel#taskName { font-size: 16px; font-weight: 600; }
+QLabel#taskName { font-size: 15px; font-weight: 600; }
+QLabel#group { color: #8aa0b4; font-size: 11px; font-weight: 700; letter-spacing: 0.6px; }
 QFrame#card { background: #1c232c; border: 1px solid #303b47; border-radius: 8px; }
 QFrame#card QLabel { background: transparent; }
 QLabel#digits { font-family: Consolas, monospace; font-size: 15px; }
@@ -198,35 +199,35 @@ class TaskRow(QFrame):
         self.owner, self.row = owner, row
         self.setObjectName('card')
         box = QVBoxLayout(self)
-        box.setContentsMargins(12, 10, 12, 10)
-        top = QHBoxLayout()
-        self.path = label('', 'muted')
-        top.addWidget(self.path, 1)
-        self.state = label('', 'muted')
-        top.addWidget(self.state)
-        box.addLayout(top)
+        box.setContentsMargins(10, 7, 10, 7)
+        box.setSpacing(6)
         heading = QHBoxLayout()
+        heading.setSpacing(6)
         self.title = label('', 'taskName')
         self.title.setWordWrap(True)
         heading.addWidget(self.title, 1)
+        self.state = label('', 'muted')  # The project heading above carries the path.
+        heading.addWidget(self.state)
         heading.addWidget(button('Edit', lambda: owner.edit(self.row)))
         for symbol, color, action, tip in [
             ('■','#ed7281','stopped','Stop — finish this session'),
             ('Ⅱ','#e0c784','paused','Pause this session'),
             ('▶','#91e0b2','running','Resume this session')]:
             b = button(symbol, lambda checked=False, a=action: self.control(a), tip)
-            b.setFixedSize(28, 28)
-            b.setStyleSheet(f'QPushButton {{ border-radius: 14px; padding: 0; color: {color}; }}')
+            b.setFixedSize(26, 26)
+            b.setStyleSheet(f'QPushButton {{ border-radius: 13px; padding: 0; color: {color}; }}')
             setattr(self, action, b)
             heading.addWidget(b)
         self.plus = button('+', lambda: owner.new_session(self.row), 'Start a new session for this task')
+        self.plus.setFixedSize(26, 26)
+        self.plus.setStyleSheet('QPushButton { border-radius: 13px; padding: 0; }')
         heading.addWidget(self.plus)
         box.addLayout(heading)
         metrics = QHBoxLayout()
         self.metrics = {}
         for key, text in [('total','TASK TOTAL'),('budget','BUDGET'),('elapsed','SESSION'),('allocated','ALLOCATED')]:
             column = QVBoxLayout()
-            column.setSpacing(3)
+            column.setSpacing(1)
             column.addWidget(label(text, 'muted'))
             value = label('', 'digits')
             column.addWidget(value)
@@ -241,7 +242,6 @@ class TaskRow(QFrame):
 
     def refresh(self, row):
         self.row = row
-        self.path.setText(f"{row['category']}  /  {row['project']}")
         self.title.setText(row['name'])
         self.state.setText(f"{'DONE' if row['done'] else row['state'].upper()} · #{row['session_count']}")
         for control in (self.stopped, self.paused, self.running, self.plus):
@@ -254,6 +254,31 @@ class TaskRow(QFrame):
         self.running.setEnabled(row['state'] == 'paused')
         self.paused.setEnabled(row['state'] == 'running')
         self.stopped.setEnabled(row['state'] != 'stopped')
+
+
+class GroupBox(QWidget):
+    """One category / project heading with its task cards indented beneath it."""
+
+    def __init__(self, category, project):
+        super().__init__()
+        box = QVBoxLayout(self)
+        box.setContentsMargins(0, 0, 0, 0)
+        box.setSpacing(3)
+        box.addWidget(label(f'{category}  /  {project}', 'group'))
+        self.members = []  # Cards placed in this group by the latest refresh.
+        self.cards = QVBoxLayout()
+        self.cards.setContentsMargins(8, 0, 0, 0)
+        self.cards.setSpacing(6)
+        box.addLayout(self.cards)
+
+    def place(self, card, index):
+        previous = getattr(card, 'group', None)
+        if previous is not None and previous is not self:
+            previous.cards.removeWidget(card)  # Moved between projects, or to Done.
+        card.group = self
+        if self.cards.indexOf(card) != index:
+            self.cards.insertWidget(index, card)
+            card.show()
 
 
 class ConfigDialog(QDialog):
@@ -443,6 +468,7 @@ class MainWindow(QMainWindow):
         self.store = store
         self.settings = QSettings('SplitTask','SplitTask')
         self.cards = {}
+        self.groups = {}
         self.inline = None
         self.setWindowTitle('Split Task')
         self.setMinimumSize(510,380)
@@ -514,17 +540,35 @@ class MainWindow(QMainWindow):
         active = [t for t in tasks if not t['done']]
         done = [t for t in tasks if t['done']]
         self.empty.setVisible(not active and self.inline is None)
+        needed = {(bool(t['done']),t['category'],t['project']) for t in tasks}
+        for key, group in self.groups.items():  # Emptied projects leave the list.
+            if key not in needed:
+                self.active.removeWidget(group)
+                self.done_list.removeWidget(group)
+                group.hide()
         for layout, rows in [(self.active,active),(self.done_list,done)]:
-            for index, row in enumerate(rows):
+            order = []
+            for row in rows:
                 card = self.cards.get(row['id'])
                 if card is None:
                     card = self.cards[row['id']] = TaskRow(self,row)
                 else:
                     card.refresh(row)
-                if layout.indexOf(card) != index:  # New, or moved between active and Done.
-                    self.active.removeWidget(card)
-                    self.done_list.removeWidget(card)
-                    layout.insertWidget(index,card)
+                key = (layout is self.done_list,row['category'],row['project'])
+                group = self.groups.get(key)
+                if group is None:
+                    group = self.groups[key] = GroupBox(row['category'],row['project'])
+                if group not in order:  # Groups keep the order their first task appears in.
+                    order.append(group)
+                    group.members = []
+                group.place(card,len(group.members))
+                group.members.append(card)
+            for index, group in enumerate(order):
+                if layout.indexOf(group) != index:  # New, or moved between active and Done.
+                    self.active.removeWidget(group)
+                    self.done_list.removeWidget(group)
+                    layout.insertWidget(index,group)
+                group.show()
         expanded = self.settings.value('done_expanded',False,type=bool)
         self.done_toggle.setText(f"{'▾' if expanded else '▸'}  Done ({len(done)})")
         self.done_toggle.setVisible(bool(done))

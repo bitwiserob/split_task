@@ -22,6 +22,7 @@ To build a desktop executable, double-click `build_windows.bat` on Windows. The 
 
 - **Quick add:** category, editable project dropdown, task name, session allocation, and shared task budget. New category/project names create groups automatically. Blank category becomes **Main**; blank project becomes **General**.
 - **Shift+A** or **Inline:** inserts an editable form directly in the tracker. Save creates the session; Cancel discards the draft.
+- **Grouped list:** the tracker groups tasks under a `Category / Project` heading, with that project's task cards indented beneath it. Groups follow the order their first task was added, and an emptied group disappears. Done tasks are grouped the same way inside the **Done** section.
 - Enter durations as minutes (`25`, `1.5`) or `HH:MM:SS` (`01:30:00`). Zero is unlimited. Allocation and budget are independent; overruns turn red and do not stop timers.
 - **Task total:** time across every session for this task. **Budget:** total allowed task time. **Session:** elapsed time for the latest session. **Allocated:** its planned duration.
 - **Red square:** stop and finish the session. **Pause:** preserve it for later. **Green play:** resume a paused session. **+**: choose an allocation and immediately start a new session with the same task identity, finishing the prior session for that task.
