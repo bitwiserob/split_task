@@ -1,4 +1,5 @@
 """SQLite domain model. Durations are seconds; budgets belong to tasks."""
+import csv
 import sqlite3
 import time
 from pathlib import Path
@@ -31,6 +32,17 @@ def clock(seconds):
     h, rest = divmod(seconds, 3600)
     m, s = divmod(rest, 60)
     return f'{h:02}:{m:02}:{s:02}'
+
+
+REPORT_COLUMNS = ['Date', 'Category', 'Project', 'Task', 'Sessions', 'Tracked Time']
+
+
+def report_csv(rows, file):
+    """Write report() rows to an open text file, matching the on-screen table."""
+    writer = csv.writer(file)
+    writer.writerow(REPORT_COLUMNS)
+    for r in rows:
+        writer.writerow([r['day'], r['category'], r['project'], r['task'], r['sessions'], clock(r['tracked'])])
 
 
 class Store:
@@ -161,6 +173,17 @@ class Store:
             self.transition(sid, 'paused')
         with self.db:
             self.db.execute('UPDATE sessions SET elapsed=?,allocated=? WHERE id=?', (elapsed, allocated, sid))
+
+    def report(self, start, end):
+        """Per-task daily totals for local ISO dates start..end inclusive.
+        Each session counts wholly on the local day it started."""
+        return self.db.execute('''SELECT date(s.created,'localtime') day,
+          c.name category,p.name project,t.name task,
+          COUNT(*) sessions,SUM(s.elapsed) tracked
+          FROM sessions s JOIN tasks t ON t.id=s.task_id
+          JOIN projects p ON p.id=t.project_id JOIN categories c ON c.id=p.category_id
+          WHERE date(s.created,'localtime') BETWEEN ? AND ?
+          GROUP BY day,t.id ORDER BY day,c.name,p.name,t.name''', (start, end)).fetchall()
 
     def rename(self, kind, ident, name):
         if kind not in ('categories', 'projects') or not name.strip():

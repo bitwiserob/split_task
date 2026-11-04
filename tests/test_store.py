@@ -1,7 +1,9 @@
+import io
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
-from store import Store, duration
+from store import Store, duration, report_csv
 
 
 class StoreTests(unittest.TestCase):
@@ -95,6 +97,32 @@ class StoreTests(unittest.TestCase):
         self.assertEqual([s['elapsed'] for s in self.store.sessions(tid)],[45,120])
         with self.assertRaises(ValueError):
             self.store.correct(first,-1,0)
+
+    def test_report_groups_by_local_start_day_and_task(self):
+        a = self.store.add('Work','Site','Layout',0,0,False)
+        b = self.store.add('Work','Site','Copy',0,0,False)
+        sessions = [(a,'2026-03-01T23:30:00Z',100),(a,'2026-03-02T00:30:00Z',50),
+                    (a,'2026-03-02T12:00:00Z',25),(b,'2026-03-02T12:00:00Z',7)]
+        with self.store.db:
+            self.store.db.execute('DELETE FROM sessions')
+            for tid,created,elapsed in sessions:
+                self.store.db.execute("INSERT INTO sessions(task_id,allocated,elapsed,state,created) VALUES (?,0,?,'stopped',?)",(tid,elapsed,created))
+        local = lambda text: datetime.fromisoformat(text.replace('Z','+00:00')).astimezone().date().isoformat()
+        expected = {}
+        for tid,created,elapsed in sessions:
+            key = (local(created),'Layout' if tid == a else 'Copy')
+            count,total = expected.get(key,(0,0))
+            expected[key] = (count+1,total+elapsed)
+        rows = self.store.report('2026-01-01','2026-12-31')
+        self.assertEqual({(r['day'],r['task']):(r['sessions'],r['tracked']) for r in rows},expected)
+        self.assertEqual([r['day'] for r in rows],sorted(r['day'] for r in rows))
+        self.assertEqual(self.store.report('2027-01-01','2027-12-31'),[])
+        out = io.StringIO()
+        report_csv(rows,out)
+        lines = out.getvalue().splitlines()
+        self.assertEqual(lines[0],'Date,Category,Project,Task,Sessions,Tracked Time')
+        self.assertEqual(len(lines),len(rows)+1)
+        self.assertIn(f"{local('2026-03-02T12:00:00Z')},Work,Site,Copy,1,00:00:07",lines)
 
     def test_duration_validation(self):
         self.assertEqual(duration('25'),1500)

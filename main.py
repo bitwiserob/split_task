@@ -4,16 +4,16 @@ import sqlite3
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, QStandardPaths, QSettings, QLockFile
+from PySide6.QtCore import Qt, QTimer, QStandardPaths, QSettings, QLockFile, QDate
 from PySide6.QtGui import QShortcut, QKeySequence
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QScrollArea, QFrame, QDialog, QFormLayout, QLineEdit,
     QComboBox, QDialogButtonBox, QMessageBox, QCheckBox, QTreeWidget,
     QTreeWidgetItem, QInputDialog, QFileDialog, QTableWidget, QTableWidgetItem,
-    QHeaderView, QAbstractItemView,
+    QHeaderView, QAbstractItemView, QDateEdit,
 )
-from store import Store, clock, duration
+from store import REPORT_COLUMNS, Store, clock, duration, report_csv
 
 
 STYLE = '''
@@ -28,8 +28,8 @@ QPushButton { background: #27323d; border: 1px solid #3d4b59; border-radius: 5px
 QPushButton:hover { background: #364656; }
 QPushButton:disabled { color: #64717e; background: #20262d; border-color: #303640; }
 QPushButton#primary { background: #91e0b2; color: #10251a; border: none; font-weight: 600; }
-QLineEdit,QComboBox { background: #10151b; border: 1px solid #435160; border-radius: 4px; padding: 7px; }
-QLineEdit:focus,QComboBox:focus { border-color: #91e0b2; }
+QLineEdit,QComboBox,QDateEdit { background: #10151b; border: 1px solid #435160; border-radius: 4px; padding: 7px; }
+QLineEdit:focus,QComboBox:focus,QDateEdit:focus { border-color: #91e0b2; }
 QScrollArea { border: none; }
 QTreeWidget,QTableWidget { border: 1px solid #36424e; alternate-background-color: #1c232c; gridline-color: #303b47; }
 QHeaderView::section { background: #27323d; color: #b4c1cc; border: none; padding: 8px; }
@@ -357,6 +357,76 @@ class ConfigDialog(QDialog):
                 QMessageBox.warning(self,'Backup failed',str(exc))
 
 
+class ReportDialog(QDialog):
+    def __init__(self, owner):
+        super().__init__(owner)
+        self.store = owner.store
+        self.rows = []
+        self.setWindowTitle('Reports')
+        self.resize(760, 520)
+        box = QVBoxLayout(self)
+        box.addWidget(label('Reports', 'brand'))
+        box.addWidget(label('One row per task per day. Each session counts on the local day it started.', 'muted'))
+        bar = QHBoxLayout()
+        today = QDate.currentDate()
+        self.start, self.end = QDateEdit(today.addDays(-6)), QDateEdit(today)
+        for text, field in [('From', self.start), ('To', self.end)]:
+            field.setCalendarPopup(True)
+            field.setDisplayFormat('yyyy-MM-dd')
+            field.dateChanged.connect(self.populate)
+            bar.addWidget(label(text))
+            bar.addWidget(field)
+        bar.addStretch()
+        bar.addWidget(button('Refresh', self.populate))
+        box.addLayout(bar)
+        self.tree = QTreeWidget()
+        self.tree.setHeaderLabels(REPORT_COLUMNS)
+        self.tree.setRootIsDecorated(False)
+        self.tree.setAlternatingRowColors(True)
+        for col, width in enumerate([95, 110, 130, 190, 70]):
+            self.tree.setColumnWidth(col, width)
+        box.addWidget(self.tree, 1)
+        self.summary = label('', 'muted')
+        box.addWidget(self.summary)
+        bottom = QHBoxLayout()
+        bottom.addWidget(button('Export CSV…', self.export, 'Save the rows shown above as CSV'))
+        bottom.addStretch()
+        bottom.addWidget(button('Done', self.accept, primary=True))
+        box.addLayout(bottom)
+        self.populate()
+
+    def range(self):
+        return self.start.date().toString(Qt.DateFormat.ISODate), self.end.date().toString(Qt.DateFormat.ISODate)
+
+    def populate(self):
+        self.store.checkpoint()
+        self.tree.clear()
+        start, end = self.range()
+        self.rows = self.store.report(start, end) if start <= end else []
+        for r in self.rows:
+            item = QTreeWidgetItem(self.tree, [r['day'], r['category'], r['project'], r['task'], str(r['sessions']), clock(r['tracked'])])
+            for col in (4, 5):
+                item.setTextAlignment(col, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        if start > end:
+            self.summary.setText('The From date is after the To date.')
+        else:
+            self.summary.setText(f"{len(self.rows)} rows · {sum(r['sessions'] for r in self.rows)} sessions · "
+                                 f"{clock(sum(r['tracked'] for r in self.rows))} tracked")
+
+    def export(self):
+        if not self.rows:
+            QMessageBox.information(self, 'Nothing to export', 'No sessions in this date range.')
+            return
+        start, end = self.range()
+        path, _ = QFileDialog.getSaveFileName(self, 'Export CSV', f'split-task-{start}-to-{end}.csv', 'CSV (*.csv)')
+        if path:
+            try:
+                with open(path, 'w', newline='', encoding='utf-8-sig') as file:  # BOM so Excel reads UTF-8.
+                    report_csv(self.rows, file)
+            except OSError as exc:
+                QMessageBox.warning(self, 'Export failed', str(exc))
+
+
 class MainWindow(QMainWindow):
     def __init__(self, store):
         super().__init__()
@@ -395,6 +465,7 @@ class MainWindow(QMainWindow):
         bottom.addWidget(button('+  Quick add',self.quick_add,'Add a task and session',True))
         bottom.addWidget(button('Inline',self.inline_add,'Add an editable row (Shift+A)'))
         bottom.addStretch()
+        bottom.addWidget(button('Reports',self.reports,'Daily tracked time per task, with CSV export'))
         bottom.addWidget(button('⚙  Config',self.config,'Manage projects, totals, and settings'))
         box.addLayout(bottom)
         self.shortcut = QShortcut(QKeySequence('Shift+A'),self)
@@ -479,6 +550,9 @@ class MainWindow(QMainWindow):
         self.inline.deleteLater()
         self.inline = None
         self.refresh()
+
+    def reports(self):
+        ReportDialog(self).exec()
 
     def config(self):
         ConfigDialog(self).exec()
