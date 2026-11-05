@@ -1,4 +1,9 @@
-"""SQLite domain model. Durations are seconds; budgets belong to tasks."""
+"""SQLite domain model. Durations are seconds; budgets belong to tasks.
+
+A day is an explicit row, opened by New day rather than by the clock, and every
+session belongs to one. Day totals are what the board shows; nothing is erased,
+so any past day can still be read back per task.
+"""
 import csv
 import sqlite3
 import time
@@ -69,6 +74,9 @@ class Store:
           allocated INTEGER NOT NULL CHECK(allocated>=0), elapsed REAL NOT NULL DEFAULT 0,
           state TEXT NOT NULL CHECK(state IN ('running','paused','stopped')),
           created TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')));
+        CREATE TABLE IF NOT EXISTS days(
+          id INTEGER PRIMARY KEY,
+          started TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')), ended TEXT);
         CREATE TABLE IF NOT EXISTS subtasks(
           id INTEGER PRIMARY KEY, task_id INTEGER NOT NULL REFERENCES tasks(id),
           name TEXT NOT NULL, done INTEGER NOT NULL DEFAULT 0,
@@ -83,7 +91,53 @@ class Store:
         if 'note' not in {r['name'] for r in self.db.execute('PRAGMA table_info(sessions)')}:
             with self.db:  # Databases from before session notes existed.
                 self.db.execute("ALTER TABLE sessions ADD COLUMN note TEXT NOT NULL DEFAULT ''")
+        if 'day_id' not in {r['name'] for r in self.db.execute('PRAGMA table_info(sessions)')}:
+            with self.db:  # Databases from before days existed: one day per local date tracked.
+                self.db.execute('ALTER TABLE sessions ADD COLUMN day_id INTEGER REFERENCES days(id)')
+                for date, in self.db.execute("SELECT DISTINCT date(created,'localtime') FROM sessions ORDER BY 1"):
+                    span = self.db.execute("SELECT MIN(created),MAX(created) FROM sessions WHERE date(created,'localtime')=?", (date,)).fetchone()
+                    did = self.db.execute('INSERT INTO days(started,ended) VALUES (?,?)', span).lastrowid
+                    self.db.execute("UPDATE sessions SET day_id=? WHERE date(created,'localtime')=?", (did, date))
+                self.db.execute('UPDATE days SET ended=NULL WHERE id=(SELECT MAX(id) FROM days)')
+        self.day = self.open_day()['id']
         self.project('Main', '')
+
+    def open_day(self):
+        """The day New day has not closed yet; days outlive restarts."""
+        query = """SELECT *,date(started,'localtime') label FROM days
+            WHERE ended IS NULL ORDER BY id DESC LIMIT 1"""
+        row = self.db.execute(query).fetchone()
+        if row is None:
+            with self.db:
+                self.db.execute('INSERT INTO days DEFAULT VALUES')
+            row = self.db.execute(query).fetchone()
+        return row
+
+    def days(self):
+        """Every day, newest first, with what it tracked. Past days are read-only history."""
+        return self.db.execute('''SELECT d.*,date(d.started,'localtime') label,
+          (SELECT COALESCE(SUM(elapsed),0) FROM sessions WHERE day_id=d.id) tracked,
+          (SELECT COUNT(DISTINCT task_id) FROM sessions WHERE day_id=d.id) tasks
+          FROM days d ORDER BY d.id DESC''').fetchall()
+
+    def new_day(self):
+        """Close the open day and carry every unfinished task into a fresh one, timers at zero.
+        The day just closed keeps its sessions, so its per-task time stays readable."""
+        self.checkpoint()
+        carried = self.db.execute('''SELECT t.id,
+          (SELECT allocated FROM sessions WHERE task_id=t.id ORDER BY id DESC LIMIT 1) allocated
+          FROM tasks t WHERE t.done=0
+          AND EXISTS(SELECT 1 FROM sessions WHERE task_id=t.id AND day_id=?) ORDER BY t.id''',
+          (self.day,)).fetchall()
+        with self.db:
+            self.db.execute("UPDATE sessions SET state='stopped' WHERE day_id=? AND state<>'stopped'", (self.day,))
+            self.db.execute("UPDATE days SET ended=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id=?", (self.day,))
+            self.day = self.db.execute('INSERT INTO days DEFAULT VALUES').lastrowid
+            for tid, allocated in carried:
+                self.db.execute("INSERT INTO sessions(task_id,allocated,state,day_id) VALUES (?,?,'paused',?)",
+                                (tid, allocated, self.day))
+        self.active = None
+        return self.day
 
     def categories(self):
         return self.db.execute('SELECT * FROM categories ORDER BY name').fetchall()
@@ -144,22 +198,34 @@ class Store:
                 self.db.execute("UPDATE sessions SET state='stopped' WHERE id=?", (previous[0],))
                 if self.active == previous[0]:
                     self.active = None
-            sid = self.db.execute("INSERT INTO sessions(task_id,allocated,state) VALUES (?,?,'paused')", (tid, allocated)).lastrowid
+            sid = self.db.execute("INSERT INTO sessions(task_id,allocated,state,day_id) VALUES (?,?,'paused',?)",
+                                  (tid, allocated, self.day)).lastrowid
         if start:
             self.transition(sid, 'running')
         return sid
 
-    def tasks(self):
+    def tasks(self, day=None):
+        """The board for one day (the open one by default): totals and session numbers
+        are that day's, while `lifetime` keeps the task's time across every day."""
+        day = self.day if day is None else day
         return self.db.execute('''SELECT t.*,p.name project,c.name category,
           s.id sid,s.allocated,s.elapsed,s.state,s.note,
           (SELECT COUNT(*) FROM subtasks WHERE task_id=t.id) subtasks,
           (SELECT COUNT(*) FROM subtasks WHERE task_id=t.id AND done=1) subtasks_done,
-          (SELECT COALESCE(SUM(elapsed),0) FROM sessions WHERE task_id=t.id) total,
-          (SELECT COUNT(*) FROM sessions WHERE task_id=t.id) session_count
+          (SELECT COALESCE(SUM(elapsed),0) FROM sessions WHERE task_id=t.id AND day_id=?) total,
+          (SELECT COALESCE(SUM(elapsed),0) FROM sessions WHERE task_id=t.id) lifetime,
+          (SELECT COUNT(*) FROM sessions WHERE task_id=t.id AND day_id=?) session_count
           FROM tasks t JOIN projects p ON p.id=t.project_id
           JOIN categories c ON c.id=p.category_id
-          JOIN sessions s ON s.id=(SELECT MAX(id) FROM sessions WHERE task_id=t.id)
-          ORDER BY t.id''').fetchall()
+          JOIN sessions s ON s.id=(SELECT MAX(id) FROM sessions WHERE task_id=t.id AND day_id=?)
+          ORDER BY t.id''', (day, day, day)).fetchall()
+
+    def totals(self):
+        """Every task ever tracked with its lifetime total; days do not scope this."""
+        return self.db.execute('''SELECT t.*,p.name project,c.name category,
+          (SELECT COALESCE(SUM(elapsed),0) FROM sessions WHERE task_id=t.id) total
+          FROM tasks t JOIN projects p ON p.id=t.project_id
+          JOIN categories c ON c.id=p.category_id ORDER BY t.id''').fetchall()
 
     def edit(self, tid, category, project, name, budget, allocated=None):
         """Allocation, when given, applies to the latest session; use correct() for others."""
@@ -183,9 +249,11 @@ class Store:
             self.db.execute('UPDATE tasks SET done=? WHERE id=?', (int(done), tid))
 
     def sessions(self, tid):
-        """Sessions oldest first; `started` is the local start time."""
-        return self.db.execute('''SELECT *,datetime(created,'localtime') started
-            FROM sessions WHERE task_id=? ORDER BY id''', (tid,)).fetchall()
+        """Sessions oldest first; `started` is the local start time, `day` its day."""
+        return self.db.execute('''SELECT s.*,datetime(s.created,'localtime') started,
+            COALESCE(date(d.started,'localtime'),date(s.created,'localtime')) day
+            FROM sessions s LEFT JOIN days d ON d.id=s.day_id
+            WHERE s.task_id=? ORDER BY s.id''', (tid,)).fetchall()
 
     def correct(self, sid, elapsed, allocated):
         """Overwrite a session's elapsed time and allocation, pausing it first if running."""
@@ -225,15 +293,19 @@ class Store:
             self.db.execute('UPDATE sessions SET note=? WHERE id=?', (note.strip(), sid))
 
     def report(self, start, end):
-        """Per-task daily totals for local ISO dates start..end inclusive.
-        Each session counts wholly on the local day it started."""
-        return self.db.execute('''SELECT date(s.created,'localtime') day,
+        """Per-task day totals for local ISO dates start..end inclusive. A session counts
+        on the date its day opened, so time keeps its day even past midnight. Days that
+        share a date are one row here; days() and tasks(day) keep them apart."""
+        return self.db.execute('''SELECT
+          COALESCE(date(d.started,'localtime'),date(s.created,'localtime')) day,
           c.name category,p.name project,t.name task,
-          COUNT(*) sessions,SUM(s.elapsed) tracked
-          FROM sessions s JOIN tasks t ON t.id=s.task_id
+          SUM(CASE WHEN s.elapsed>0 THEN 1 ELSE 0 END) sessions,SUM(s.elapsed) tracked
+          FROM sessions s LEFT JOIN days d ON d.id=s.day_id
+          JOIN tasks t ON t.id=s.task_id
           JOIN projects p ON p.id=t.project_id JOIN categories c ON c.id=p.category_id
-          WHERE date(s.created,'localtime') BETWEEN ? AND ?
-          GROUP BY day,t.id ORDER BY day,c.name,p.name,t.name''', (start, end)).fetchall()
+          WHERE day BETWEEN ? AND ?
+          GROUP BY day,t.id HAVING tracked>0
+          ORDER BY day,c.name,p.name,t.name''', (start, end)).fetchall()
 
     def rename(self, kind, ident, name):
         if kind not in ('categories', 'projects') or not name.strip():

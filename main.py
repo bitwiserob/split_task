@@ -62,6 +62,16 @@ def button(text, callback, tip='', primary=False):
     return w
 
 
+def numbering(sessions):
+    """Session numbers restart with each day, matching what the cards show."""
+    seen, numbers = {}, []
+    for s in sessions:
+        key = s['day_id'] if s['day_id'] is not None else s['day']
+        seen[key] = seen.get(key, 0) + 1
+        numbers.append(seen[key])
+    return numbers
+
+
 class TaskForm(QWidget):
     def __init__(self, store, row=None):
         super().__init__()
@@ -111,7 +121,7 @@ class TaskForm(QWidget):
 
 class SessionTable(QTableWidget):
     """Editable allocation and elapsed time for each session of one task."""
-    COLUMNS = ['#', 'Started', 'State', 'Allocation', 'Elapsed']
+    COLUMNS = ['#', 'Day', 'Started', 'State', 'Allocation', 'Elapsed']
 
     def __init__(self, store, tid):
         super().__init__(0, len(self.COLUMNS))
@@ -121,27 +131,29 @@ class SessionTable(QTableWidget):
         self.setAlternatingRowColors(True)
         self.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         self.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        for col in (0, 1):
+        for col in (0, 1, 2):
             self.horizontalHeader().setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
         self.sessions = store.sessions(tid)
+        self.numbers = numbering(self.sessions)
         self.setRowCount(len(self.sessions))
         for n, s in enumerate(self.sessions):
             self.fill(n, s)
 
     def fill(self, n, s):
         running = s['state'] == 'running'
-        for col, text in enumerate([str(n+1), s['started'], s['state'], clock(s['allocated']), clock(s['elapsed'])]):
+        for col, text in enumerate([f'#{self.numbers[n]}', s['day'], s['started'], s['state'],
+                                    clock(s['allocated']), clock(s['elapsed'])]):
             item = QTableWidgetItem(text)
-            if col < 3 or running:
+            if col < 4 or running:
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             self.setItem(n, col, item)
         if running:
-            self.setCellWidget(n, 2, button('Pause to correct', lambda checked=False: self.pause(n),
+            self.setCellWidget(n, 3, button('Pause to correct', lambda checked=False: self.pause(n),
                                             'Pause this session so its times can be corrected'))
 
     def pause(self, n):
         self.store.transition(self.sessions[n]['id'], 'paused')
-        self.removeCellWidget(n, 2)
+        self.removeCellWidget(n, 3)
         self.sessions[n] = next(s for s in self.store.sessions(self.tid) if s['id'] == self.sessions[n]['id'])
         self.fill(n, self.sessions[n])
 
@@ -149,13 +161,13 @@ class SessionTable(QTableWidget):
         """(sid, elapsed, allocated) for edited rows; untouched rows keep sub-second precision."""
         changes = []
         for n, s in enumerate(self.sessions):
-            allocated, elapsed = self.item(n, 3).text(), self.item(n, 4).text()
+            allocated, elapsed = self.item(n, 4).text(), self.item(n, 5).text()
             if allocated == clock(s['allocated']) and elapsed == clock(s['elapsed']):
                 continue
             try:
                 changes.append((s['id'], duration(elapsed), duration(allocated)))
             except ValueError as exc:
-                raise ValueError(f'Session #{n+1}: {exc}') from None
+                raise ValueError(f"{s['day']} session #{self.numbers[n]}: {exc}") from None
         return changes
 
 
@@ -258,8 +270,9 @@ class TaskDetails(QDialog):
         box.addWidget(label('SESSION NOTE', 'group'))
         self.sessions = QComboBox()
         self.sessions.setToolTip('Every session keeps its own note')
-        for n, s in enumerate(self.store.sessions(self.row['id']), 1):
-            self.sessions.addItem(f"#{n} · {s['started']} · {s['state']}", s['id'])
+        rows = self.store.sessions(self.row['id'])
+        for n, s in zip(numbering(rows), rows):
+            self.sessions.addItem(f"{s['day']} · #{n} · {s['state']}", s['id'])
         self.sessions.setCurrentIndex(self.sessions.count() - 1)  # The session shown on the card.
         self.sessions.currentIndexChanged.connect(self.load_note)
         box.addWidget(self.sessions)
@@ -460,7 +473,7 @@ class ConfigDialog(QDialog):
         self.resize(720, 520)
         box = QVBoxLayout(self)
         box.addWidget(label('Projects & totals', 'brand'))
-        box.addWidget(label('Expand tasks to see individual sessions. Totals include every session.', 'muted'))
+        box.addWidget(label('Expand tasks to see individual sessions. Totals include every session of every day.', 'muted'))
         self.tree = QTreeWidget()
         self.tree.setHeaderLabels(['Category / project / task / session', 'Tracked', 'Budget / allocation'])
         self.tree.setColumnWidth(0, 370)
@@ -485,7 +498,7 @@ class ConfigDialog(QDialog):
     def populate(self):
         self.store.checkpoint()
         self.tree.clear()
-        tasks = self.store.tasks()
+        tasks = self.store.totals()  # Config reports lifetime time, not just today's.
         for category in self.store.categories():
             group_tasks = [t for t in tasks if t['category'] == category['name']]
             c = QTreeWidgetItem(self.tree, [category['name'], clock(sum(t['total'] for t in group_tasks)),clock(sum(t['budget'] for t in group_tasks))])
@@ -572,7 +585,7 @@ class ReportDialog(QDialog):
         self.resize(760, 520)
         box = QVBoxLayout(self)
         box.addWidget(label('Reports', 'brand'))
-        box.addWidget(label('One row per task per day. Each session counts on the local day it started.', 'muted'))
+        box.addWidget(label('One row per task per day. A session counts on the day it was tracked in.', 'muted'))
         bar = QHBoxLayout()
         today = QDate.currentDate()
         self.start, self.end = QDateEdit(today.addDays(-6)), QDateEdit(today)
@@ -682,6 +695,7 @@ class MainWindow(QMainWindow):
         bottom = QHBoxLayout()
         bottom.addWidget(button('+  Quick add',self.quick_add,'Add a task and session',True))
         bottom.addWidget(button('Inline',self.inline_add,'Add an editable row (Shift+A)'))
+        bottom.addWidget(button('New day',self.new_day,'Close today and carry unfinished tasks over with fresh timers'))
         bottom.addStretch()
         bottom.addWidget(button('Reports',self.reports,'Daily tracked time per task, with CSV export'))
         bottom.addWidget(button('⚙  Config',self.config,'Manage projects, totals, and settings'))
@@ -711,6 +725,12 @@ class MainWindow(QMainWindow):
         active = [t for t in tasks if not t['done']]
         done = [t for t in tasks if t['done']]
         self.empty.setVisible(not active and self.inline is None)
+        for tid in [t for t in self.cards if t not in {row['id'] for row in tasks}]:
+            card = self.cards.pop(tid)  # Finished on an earlier day; its history stays there.
+            if getattr(card,'group',None):
+                card.group.cards.removeWidget(card)
+            card.setParent(None)
+            card.deleteLater()
         needed = {(bool(t['done']),t['category'],t['project']) for t in tasks}
         for key, group in self.groups.items():  # Emptied projects leave the list.
             if key not in needed:
@@ -745,8 +765,25 @@ class MainWindow(QMainWindow):
         self.done_toggle.setVisible(bool(done))
         self.done.setVisible(bool(done) and expanded)
         running = next((t['name'] for t in tasks if t['state']=='running'),None)
-        self.summary.setText(f"{len(active)} tasks" + (f" · {len(done)} done" if done else '') +
+        self.summary.setText(f"Day {self.store.open_day()['label']} · {len(active)} tasks" +
+                             (f" · {len(done)} done" if done else '') +
                              f" · {clock(sum(t['total'] for t in tasks))} tracked" + (' · Timer running' if running else ' · Timers idle'))
+
+    def new_day(self):
+        tasks = self.store.tasks()
+        carried = [t for t in tasks if not t['done']]
+        lines = [f"{t['name']} — {clock(t['total'])}" + (' · done' if t['done'] else '')
+                 for t in sorted(tasks,key=lambda t: -t['total'])]
+        if len(lines) > 10:
+            lines = lines[:10] + [f'… and {len(tasks)-10} more']
+        question = (f"Start a new day?\n\n{self.store.open_day()['label']} tracked "
+                    f"{clock(sum(t['total'] for t in tasks))}:\n  " + ('\n  '.join(lines) or 'Nothing tracked yet.') +
+                    f"\n\nThat stays on this day, in Reports and in Config totals.\n"
+                    f"{len(carried)} unfinished task{'' if len(carried) == 1 else 's'} carry over "
+                    f"with timers back at zero.")
+        if QMessageBox.question(self,'New day',question) == QMessageBox.StandardButton.Yes:
+            self.store.new_day()
+            self.refresh()
 
     def toggle_done(self):
         self.settings.setValue('done_expanded',not self.settings.value('done_expanded',False,type=bool))

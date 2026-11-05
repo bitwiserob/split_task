@@ -167,6 +167,8 @@ class StoreTests(unittest.TestCase):
         row = self.store.tasks()[0]
         self.assertEqual((row['name'],row['budget'],row['total'],row['state'],row['done']),('Layout',600,42.5,'paused',0))
         self.assertEqual((row['note'],row['subtasks']),('',0))
+        self.assertEqual(self.store.sessions(row['id'])[0]['day'],self.store.open_day()['label'])
+        self.assertEqual([d['tracked'] for d in self.store.days()],[42.5])
         self.store.set_note(row['sid'],'Added after migrating')
         self.store.add_subtask(row['id'],'Added after migrating')
         self.store.close()
@@ -215,6 +217,49 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(self.store.tasks()[0]['note'],'')
         self.store.correct(first,120,600)  # Corrections leave the note alone.
         self.assertEqual(self.store.sessions(tid)[0]['note'],'Kick-off')
+
+    def test_new_day_resets_the_board_and_keeps_the_day_tracked(self):
+        emails = self.store.add('Work','A','Emails',3600,1500)
+        self.time = 300  # Starting Finished pauses Emails; only one timer runs.
+        finished = self.store.add('Work','A','Finished',3600,1500)
+        self.time = 600
+        self.store.set_done(finished)
+        self.store.transition(next(t['sid'] for t in self.store.tasks() if t['id'] == emails),'running')
+        self.time = 1200  # The day tracked 900s on Emails and 300s on Finished.
+        first = self.store.day
+        self.store.new_day()
+        self.assertNotEqual(self.store.day,first)
+        self.assertIsNone(self.store.active)
+        board = self.store.tasks()
+        self.assertEqual([t['name'] for t in board],['Emails'])  # Done tasks stay on their day.
+        row = board[0]
+        self.assertEqual((row['total'],row['elapsed'],row['state'],row['session_count']),(0,0,'paused',1))
+        self.assertEqual((row['lifetime'],row['allocated'],row['budget']),(900,1500,3600))
+        yesterday = self.store.tasks(first)  # The closed day is still readable per task.
+        self.assertEqual({t['name']:t['total'] for t in yesterday},{'Emails':900,'Finished':300})
+        self.assertEqual([t['state'] for t in yesterday],['stopped','stopped'])
+        self.store.transition(row['sid'],'running')
+        self.time = 1300
+        self.store.checkpoint()
+        self.assertEqual(self.store.tasks()[0]['total'],100)
+        self.assertEqual(self.store.tasks(first)[0]['total'],900)  # A closed day never moves.
+        self.assertEqual(self.store.tasks()[0]['lifetime'],1000)
+        rows = self.store.report('0000-01-01','9999-12-31')  # Days sharing a date merge per task.
+        self.assertEqual(sorted((r['task'],r['sessions'],r['tracked']) for r in rows),
+                         [('Emails',2,1000),('Finished',1,300)])
+        self.assertEqual(len(self.store.days()),2)
+        self.assertEqual([d['tracked'] for d in self.store.days()],[100,1200])
+        self.assertEqual([d['tasks'] for d in self.store.days()],[1,2])
+
+    def test_new_day_carries_the_latest_allocation_and_survives_restart(self):
+        tid = self.store.add('Work','A','Task',0,600)
+        self.store.new_session(tid,1800)
+        day = self.store.new_day()
+        self.assertEqual(self.store.tasks()[0]['allocated'],1800)
+        self.store.close()
+        self.store = Store(self.path,lambda:self.time)
+        self.assertEqual(self.store.day,day)  # Only New day ends a day, not a restart.
+        self.assertEqual(self.store.tasks()[0]['session_count'],1)
 
     def test_duration_validation(self):
         self.assertEqual(duration('25'),1500)
