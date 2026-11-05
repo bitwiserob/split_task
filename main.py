@@ -24,12 +24,15 @@ QLabel#muted { color: #91a1af; font-size: 11px; }
 QLabel#taskName { font-size: 15px; font-weight: 600; }
 QLabel#group { color: #8aa0b4; font-size: 11px; font-weight: 700; letter-spacing: 0.6px; }
 QFrame#card { background: #1c232c; border: 1px solid #303b47; border-radius: 8px; }
+QFrame#banner { background: #241f1a; border: 1px solid #5b4a33; border-radius: 6px; }
+QLabel#closed { color: #e0c784; font-size: 11px; }
 QFrame#card QLabel { background: transparent; }
 QLabel#digits { font-family: Consolas, monospace; font-size: 15px; }
 QPushButton { background: #27323d; border: 1px solid #3d4b59; border-radius: 5px; padding: 7px 10px; }
 QPushButton:hover { background: #364656; }
 QPushButton:disabled { color: #64717e; background: #20262d; border-color: #303640; }
 QPushButton#primary { background: #91e0b2; color: #10251a; border: none; font-weight: 600; }
+QPushButton#primary:disabled { background: #3b4a43; color: #7d8a84; }
 QLineEdit,QComboBox,QDateEdit { background: #10151b; border: 1px solid #435160; border-radius: 4px; padding: 7px; }
 QLineEdit:focus,QComboBox:focus,QDateEdit:focus { border-color: #91e0b2; }
 QScrollArea { border: none; }
@@ -422,14 +425,14 @@ class TaskRow(QFrame):
         self.owner.store.transition(self.row['sid'], state)
         self.owner.refresh()
 
-    def refresh(self, row):
+    def refresh(self, row, live=True):
         self.row = row
         self.title.setText(row['name'])
         marks = f" · ✓{row['subtasks_done']}/{row['subtasks']}" if row['subtasks'] else ''
         marks += ' · ✎' if row['note'] else ''  # This session has a note.
         self.state.setText(f"{'DONE' if row['done'] else row['state'].upper()} · #{row['session_count']}{marks}")
         for control in (self.stopped, self.paused, self.running, self.plus):
-            control.setVisible(not row['done'])  # Reopen from Edit to track more time.
+            control.setVisible(live and not row['done'])  # A closed day takes no more time.
         for key, value in self.metrics.items():
             value.setText('—' if key in ('budget','allocated') and row[key] == 0 else clock(row[key]))
         for actual, limit in [('total','budget'), ('elapsed','allocated')]:
@@ -654,6 +657,8 @@ class MainWindow(QMainWindow):
         self.cards = {}
         self.groups = {}
         self.inline = None
+        self.viewing = None  # A closed day's id while revisiting it, otherwise the open day.
+        self.day_ids, self.day_names = [], {}
         self.setWindowTitle('Split Task')
         self.setMinimumSize(510,380)
         self.resize(540,720)
@@ -666,7 +671,23 @@ class MainWindow(QMainWindow):
         head.addStretch()
         head.addWidget(label('MAKE TIME VISIBLE','muted'))
         box.addLayout(head)
-        box.addWidget(label('One task at a time. Every session counts.','muted'))
+        subtitle = QHBoxLayout()
+        subtitle.addWidget(label('One task at a time. Every session counts.','muted'),1)
+        self.picker = QComboBox()
+        self.picker.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+        self.picker.setToolTip('Revisit a day. Closed days are read-only.')
+        self.picker.currentIndexChanged.connect(self.pick_day)
+        subtitle.addWidget(self.picker)
+        box.addLayout(subtitle)
+        self.banner = QFrame()
+        self.banner.setObjectName('banner')
+        banner = QHBoxLayout(self.banner)
+        banner.setContentsMargins(10,6,6,6)
+        self.banner_text = label('','closed')
+        self.banner_text.setWordWrap(True)
+        banner.addWidget(self.banner_text,1)
+        banner.addWidget(button('Back to the open day',self.back_to_today,'Return to the day you are tracking into'))
+        box.addWidget(self.banner)
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         content = QWidget()
@@ -693,9 +714,11 @@ class MainWindow(QMainWindow):
         self.summary = label('','muted')
         box.addWidget(self.summary)
         bottom = QHBoxLayout()
-        bottom.addWidget(button('+  Quick add',self.quick_add,'Add a task and session',True))
-        bottom.addWidget(button('Inline',self.inline_add,'Add an editable row (Shift+A)'))
-        bottom.addWidget(button('New day',self.new_day,'Close today and carry unfinished tasks over with fresh timers'))
+        self.quick = button('+  Quick add',self.quick_add,'Add a task and session',True)
+        self.inline_button = button('Inline',self.inline_add,'Add an editable row (Shift+A)')
+        self.day_button = button('New day',self.new_day,'Close today and carry unfinished tasks over with fresh timers')
+        for control in (self.quick, self.inline_button, self.day_button):
+            bottom.addWidget(control)
         bottom.addStretch()
         bottom.addWidget(button('Reports',self.reports,'Daily tracked time per task, with CSV export'))
         bottom.addWidget(button('⚙  Config',self.config,'Manage projects, totals, and settings'))
@@ -721,10 +744,23 @@ class MainWindow(QMainWindow):
         self.refresh()
 
     def refresh(self):
-        tasks = self.store.tasks()
+        days = self.populate_days()
+        live = self.viewing is None
+        day = next((d for d in days if d['id'] == (self.store.day if live else self.viewing)), None)
+        if day is None:  # The day went away; fall back to the one being tracked into.
+            live, self.viewing, day = True, None, self.store.open_day()
+        tasks = self.store.tasks(day['id'])
         active = [t for t in tasks if not t['done']]
         done = [t for t in tasks if t['done']]
-        self.empty.setVisible(not active and self.inline is None)
+        self.banner.setVisible(not live)
+        if not live:
+            self.banner_text.setText('Read-only: this day is closed. '
+                                     'Edit still corrects its times.')
+        for control in (self.quick, self.inline_button, self.day_button):
+            control.setEnabled(live)  # Adding and ending days belong to the open day.
+        self.empty.setText('Your next session starts here.\n\nQuick add a task, or press Shift+A.' if live
+                           else 'Nothing was tracked on this day.')
+        self.empty.setVisible(not active and not done and self.inline is None)
         for tid in [t for t in self.cards if t not in {row['id'] for row in tasks}]:
             card = self.cards.pop(tid)  # Finished on an earlier day; its history stays there.
             if getattr(card,'group',None):
@@ -743,8 +779,7 @@ class MainWindow(QMainWindow):
                 card = self.cards.get(row['id'])
                 if card is None:
                     card = self.cards[row['id']] = TaskRow(self,row)
-                else:
-                    card.refresh(row)
+                card.refresh(row,live)
                 key = (layout is self.done_list,row['category'],row['project'])
                 group = self.groups.get(key)
                 if group is None:
@@ -764,12 +799,15 @@ class MainWindow(QMainWindow):
         self.done_toggle.setText(f"{'▾' if expanded else '▸'}  Done ({len(done)})")
         self.done_toggle.setVisible(bool(done))
         self.done.setVisible(bool(done) and expanded)
-        running = next((t['name'] for t in tasks if t['state']=='running'),None)
-        self.summary.setText(f"Day {self.store.open_day()['label']} · {len(active)} tasks" +
-                             (f" · {len(done)} done" if done else '') +
-                             f" · {clock(sum(t['total'] for t in tasks))} tracked" + (' · Timer running' if running else ' · Timers idle'))
+        running = self.store.running()
+        self.summary.setText(f"Day {self.day_names.get(day['id'],day['label'])}" + ('' if live else ' · closed') +
+                             f" · {len(active)} tasks" + (f" · {len(done)} done" if done else '') +
+                             f" · {clock(sum(t['total'] for t in tasks))} tracked" +
+                             (f' · {running} running' if running else ' · Timers idle'))
 
     def new_day(self):
+        if self.viewing:
+            return
         tasks = self.store.tasks()
         carried = [t for t in tasks if not t['done']]
         lines = [f"{t['name']} — {clock(t['total'])}" + (' · done' if t['done'] else '')
@@ -783,13 +821,48 @@ class MainWindow(QMainWindow):
                     f"with timers back at zero.")
         if QMessageBox.question(self,'New day',question) == QMessageBox.StandardButton.Yes:
             self.store.new_day()
+            self.viewing = None
             self.refresh()
+
+    def populate_days(self):
+        """Rebuild the picker only when a day is added, so it never fights the timer."""
+        days = self.store.days()
+        if [d['id'] for d in days] == self.day_ids:
+            return days
+        self.day_ids = [d['id'] for d in days]
+        labels = [d['label'] for d in days]
+        self.day_names = {d['id']: d['label'] + (f" {d['opened']}" if labels.count(d['label']) > 1 else '')
+                          for d in days}  # Two days on one date are told apart by their time.
+        self.picker.blockSignals(True)
+        self.picker.clear()
+        for d in days:
+            self.picker.addItem(f"{self.day_names[d['id']]} · " +
+                                ('open' if d['ended'] is None else clock(d['tracked'])), d['id'])
+        self.picker.setCurrentIndex(self.day_ids.index(self.viewing) if self.viewing in self.day_ids else 0)
+        self.picker.blockSignals(False)
+        return days
+
+    def pick_day(self, index):
+        day = self.picker.itemData(index)
+        self.viewing = None if day is None or day == self.store.day else day
+        if self.inline and not self.viewing:
+            self.inline.form.name.setFocus()
+        elif self.inline:
+            self.cancel_inline()  # A closed day takes no new task.
+        self.refresh()
+
+    def back_to_today(self):
+        self.viewing = None
+        self.picker.setCurrentIndex(0)
+        self.refresh()
 
     def toggle_done(self):
         self.settings.setValue('done_expanded',not self.settings.value('done_expanded',False,type=bool))
         self.refresh()
 
     def quick_add(self):
+        if self.viewing:  # Shift+A and the buttons only add to the open day.
+            return
         TaskDialog(self).exec()
         self.refresh()
 
@@ -811,6 +884,8 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self,'Check allocation',str(exc))
 
     def inline_add(self):
+        if self.viewing:
+            return
         if self.inline:
             self.inline.form.name.setFocus()
             return

@@ -116,6 +116,7 @@ class Store:
     def days(self):
         """Every day, newest first, with what it tracked. Past days are read-only history."""
         return self.db.execute('''SELECT d.*,date(d.started,'localtime') label,
+          strftime('%H:%M',d.started,'localtime') opened,
           (SELECT COALESCE(SUM(elapsed),0) FROM sessions WHERE day_id=d.id) tracked,
           (SELECT COUNT(DISTINCT task_id) FROM sessions WHERE day_id=d.id) tasks
           FROM days d ORDER BY d.id DESC''').fetchall()
@@ -219,6 +220,12 @@ class Store:
           JOIN categories c ON c.id=p.category_id
           JOIN sessions s ON s.id=(SELECT MAX(id) FROM sessions WHERE task_id=t.id AND day_id=?)
           ORDER BY t.id''', (day, day, day)).fetchall()
+
+    def running(self):
+        """The task whose timer is going, whichever day the board is showing."""
+        row = self.db.execute('''SELECT t.name FROM sessions s JOIN tasks t ON t.id=s.task_id
+            WHERE s.state='running' LIMIT 1''').fetchone()
+        return row[0] if row else None
 
     def totals(self):
         """Every task ever tracked with its lifetime total; days do not scope this."""
