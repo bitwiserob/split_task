@@ -55,6 +55,34 @@ def report_csv(rows, file):
         writer.writerow([r['day'], r['category'], r['project'], r['task'], r['sessions'], clock(r['tracked'])])
 
 
+SPRINT_ITEM_COLUMNS = ['Date', 'Started', 'Sprint', '#', 'Item', 'Planned', 'Actual', 'Delta', 'Result']
+SPRINT_RUN_COLUMNS = ['Date', 'Started', 'Sprint', 'Items', 'Done', 'Skipped', 'Planned', 'Actual', 'Delta']
+
+
+def signed(seconds):
+    """A countdown's delta: + when the item ran over, - when it came in under."""
+    seconds = round(seconds)
+    return ('+' if seconds > 0 else '-' if seconds < 0 else '') + clock(abs(seconds))
+
+
+def sprint_table(rows, per_item):
+    """Sprint report rows as text, for the table on screen and the CSV alike. An item
+    the run never reached has no delta to show: nothing was measured against it."""
+    if per_item:
+        return [[r['day'], r['at'], r['sprint'], str(r['position']), r['item'],
+                 clock(r['planned']), clock(r['actual']),
+                 '—' if r['state'] == 'waiting' else signed(r['delta']), r['state']]
+                for r in rows]
+    return [[r['day'], r['at'], r['sprint'], str(r['items']), str(r['done']), str(r['skipped']),
+             clock(r['planned']), clock(r['actual']), signed(r['delta'])] for r in rows]
+
+
+def sprint_csv(table, columns, file):
+    """Write a formatted sprint table to an open text file, exactly as shown."""
+    writer = csv.writer(file)
+    writer.writerow(columns)
+    writer.writerows(table)
+
 class Store:
     def __init__(self, path, now=time.monotonic):
         self.now = now
@@ -356,17 +384,28 @@ class Store:
     # back to back: finishing one starts the next on the spot. Items are not tasks and
     # carry no day, so nothing here reaches tasks(), totals() or report().
 
-    def sprint(self):
-        """The current sprint — the newest one — with its planned and spent totals.
-        None until the first sprint is created; past sprints are kept, not erased."""
+    def sprints(self):
+        """Every sprint, oldest first: the order back and forward walk. The last is
+        the current one, the only sprint that can still be changed or run."""
+        return self.db.execute('''SELECT id,name,started,ended,
+          date(COALESCE(started,created),'localtime') day,
+          strftime('%H:%M',COALESCE(started,created),'localtime') at
+          FROM sprints ORDER BY id''').fetchall()
+
+    def sprint(self, sprint_id=None):
+        """One sprint with its planned and spent totals — the current one, the newest,
+        unless an earlier id is named. None until the first sprint is created; past
+        sprints are kept, not erased."""
         return self.db.execute('''SELECT s.*,
+          date(COALESCE(s.started,s.created),'localtime') day,
+          strftime('%H:%M',COALESCE(s.started,s.created),'localtime') at,
           (SELECT COUNT(*) FROM sprint_items WHERE sprint_id=s.id) items,
           (SELECT COUNT(*) FROM sprint_items WHERE sprint_id=s.id AND state='done') items_done,
           (SELECT COUNT(*) FROM sprint_items WHERE sprint_id=s.id AND state='skipped') items_skipped,
           (SELECT COUNT(*) FROM sprint_items WHERE sprint_id=s.id AND state='waiting') items_waiting,
           (SELECT COALESCE(SUM(allocated),0) FROM sprint_items WHERE sprint_id=s.id) planned,
           (SELECT COALESCE(SUM(elapsed),0) FROM sprint_items WHERE sprint_id=s.id) spent
-          FROM sprints s WHERE s.id=(SELECT MAX(id) FROM sprints)''').fetchone()
+          FROM sprints s WHERE s.id=COALESCE(?,(SELECT MAX(id) FROM sprints))''', (sprint_id,)).fetchone()
 
     def new_sprint(self, name):
         """Put the current sprint aside and start planning a fresh one."""
@@ -382,10 +421,12 @@ class Store:
         with self.db:
             self.db.execute('UPDATE sprints SET name=? WHERE id=(SELECT MAX(id) FROM sprints)', (name.strip(),))
 
-    def sprint_items(self):
-        """The current sprint's items in run order, with the time each has left."""
+    def sprint_items(self, sprint_id=None):
+        """A sprint's items in run order, with the time each has left. The current
+        sprint's unless an earlier id is named."""
         return self.db.execute('''SELECT *,allocated-elapsed remaining FROM sprint_items
-            WHERE sprint_id=(SELECT MAX(id) FROM sprints) ORDER BY position,id''').fetchall()
+            WHERE sprint_id=COALESCE(?,(SELECT MAX(id) FROM sprints))
+            ORDER BY position,id''', (sprint_id,)).fetchall()
 
     def add_sprint_item(self, name, allocated):
         """Append an item to the plan. An item is a countdown, so zero is not allowed."""
@@ -498,6 +539,29 @@ class Store:
             sprint = self.db.execute('SELECT MAX(id) FROM sprints').fetchone()[0]
             self.db.execute("UPDATE sprint_items SET state='waiting',elapsed=0 WHERE sprint_id=?", (sprint,))
             self.db.execute('UPDATE sprints SET started=NULL,ended=NULL WHERE id=?', (sprint,))
+
+    def sprint_report(self, start, end):
+        """One row per item of every sprint run on local dates start..end inclusive.
+        A run is dated by the day it started, so a sprint begun before midnight keeps
+        that day. Sprints only planned, never started, are not runs and do not appear."""
+        return self.db.execute('''SELECT date(s.started,'localtime') day,
+          time(s.started,'localtime') at, s.name sprint, s.id sprint_id, i.name item,
+          ROW_NUMBER() OVER (PARTITION BY s.id ORDER BY i.position,i.id) position,
+          i.allocated planned, i.elapsed actual, i.elapsed-i.allocated delta, i.state
+          FROM sprints s JOIN sprint_items i ON i.sprint_id=s.id
+          WHERE s.started IS NOT NULL AND day BETWEEN ? AND ?
+          ORDER BY day,at,s.id,i.position,i.id''', (start, end)).fetchall()
+
+    def sprint_runs(self, start, end):
+        """One row per sprint run in the range: what it planned against what it took."""
+        return self.db.execute('''SELECT date(s.started,'localtime') day,
+          time(s.started,'localtime') at, s.name sprint, s.ended, COUNT(i.id) items,
+          COALESCE(SUM(i.state='done'),0) done, COALESCE(SUM(i.state='skipped'),0) skipped,
+          COALESCE(SUM(i.allocated),0) planned, COALESCE(SUM(i.elapsed),0) actual,
+          COALESCE(SUM(i.elapsed),0)-COALESCE(SUM(i.allocated),0) delta
+          FROM sprints s LEFT JOIN sprint_items i ON i.sprint_id=s.id
+          WHERE s.started IS NOT NULL AND day BETWEEN ? AND ?
+          GROUP BY s.id ORDER BY day,at,s.id''', (start, end)).fetchall()
 
     def close(self):
         self.checkpoint()

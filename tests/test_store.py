@@ -4,7 +4,10 @@ import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
-from store import Store, duration, report_csv
+from store import (
+    SPRINT_ITEM_COLUMNS, SPRINT_RUN_COLUMNS, Store, duration, report_csv, signed,
+    sprint_csv, sprint_table,
+)
 
 
 class StoreTests(unittest.TestCase):
@@ -421,6 +424,132 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(self.store.totals(),[])
         self.assertEqual(self.store.report('2000-01-01','2999-12-31'),[])
 
+
+    def dated_run(self, started='2026-03-02T12:00:00Z', ended='2026-03-02T12:30:00Z'):
+        """Pin the current run to a known UTC start, the way a real one is dated."""
+        with self.store.db:
+            self.store.db.execute('UPDATE sprints SET started=?,ended=? WHERE id=(SELECT MAX(id) FROM sprints)',
+                                  (started,ended))
+        return datetime.fromisoformat(started.replace('Z','+00:00')).astimezone().date().isoformat()
+
+    def test_sprint_report_rows_per_item_and_per_run(self):
+        self.plan(name='Morning',items=(('One',60),('Two',120)))
+        self.store.sprint_start()
+        self.time = 90  # One takes 90s against a 60s countdown.
+        self.store.sprint_advance()
+        self.time = 150  # Two is skipped after 60s of a 120s countdown.
+        self.store.sprint_advance('skipped')
+        day = self.dated_run()
+        items = self.store.sprint_report(day,day)
+        self.assertEqual([(r['day'],r['sprint'],r['position'],r['item'],r['planned'],r['actual'],
+                           r['delta'],r['state']) for r in items],
+                         [(day,'Morning',1,'One',60,90,30,'done'),
+                          (day,'Morning',2,'Two',120,60,-60,'skipped')])
+        runs = self.store.sprint_runs(day,day)
+        self.assertEqual([(r['day'],r['sprint'],r['items'],r['done'],r['skipped'],
+                           r['planned'],r['actual'],r['delta']) for r in runs],
+                         [(day,'Morning',2,1,1,180,150,-30)])
+        for out_of_range in [('2027-01-01','2027-12-31'),('2020-01-01','2020-12-31')]:
+            self.assertEqual(self.store.sprint_report(*out_of_range),[])
+            self.assertEqual(self.store.sprint_runs(*out_of_range),[])
+
+    def test_a_run_keeps_the_day_it_started_on(self):
+        self.plan(name='Late night',items=(('One',60),))
+        self.store.sprint_start()
+        self.time = 60
+        self.store.sprint_advance()
+        day = self.dated_run('2026-03-02T23:50:00Z','2026-03-03T00:20:00Z')
+        self.assertEqual([r['day'] for r in self.store.sprint_runs(day,day)],[day])
+
+    def test_sprints_that_were_never_started_are_not_runs(self):
+        self.plan(name='Planned only',items=(('One',60),))
+        whole = ('2000-01-01','2999-12-31')
+        self.assertEqual(self.store.sprint_report(*whole),[])
+        self.assertEqual(self.store.sprint_runs(*whole),[])
+        self.store.sprint_start()  # Starting it is what makes it a run.
+        self.assertEqual(len(self.store.sprint_runs(*whole)),1)
+        self.assertEqual(len(self.store.sprint_report(*whole)),1)
+
+    def test_each_sprint_is_reported_on_its_own(self):
+        self.plan(name='First',items=(('One',60),))
+        self.store.sprint_start()
+        self.time = 30
+        self.store.sprint_advance()
+        self.plan(name='Second',items=(('Two',60),('Three',60)))
+        self.store.sprint_start()
+        self.time = 100
+        self.store.sprint_advance()
+        whole = ('2000-01-01','2999-12-31')
+        self.assertEqual([(r['sprint'],r['items']) for r in self.store.sprint_runs(*whole)],
+                         [('First',1),('Second',2)])
+        self.assertEqual([(r['sprint'],r['position'],r['item']) for r in self.store.sprint_report(*whole)],
+                         [('First',1,'One'),('Second',1,'Two'),('Second',2,'Three')])
+
+    def test_sprint_tables_and_csv_match_what_is_shown(self):
+        self.assertEqual([signed(0),signed(90),signed(-90),signed(-0.4)],
+                         ['00:00:00','+00:01:30','-00:01:30','00:00:00'])
+        self.plan(name='Morning',items=(('One',60),('Two',120)))
+        self.store.sprint_start()
+        self.time = 90
+        self.store.sprint_advance()
+        self.time = 150
+        self.store.sprint_advance('skipped')
+        day = self.dated_run()
+        for rows, per_item, columns, expected in [
+                (self.store.sprint_report(day,day),True,SPRINT_ITEM_COLUMNS,
+                 [day,'07:00:00','Morning','1','One','00:01:00','00:01:30','+00:00:30','done']),
+                (self.store.sprint_runs(day,day),False,SPRINT_RUN_COLUMNS,
+                 [day,'07:00:00','Morning','2','1','1','00:03:00','00:02:30','-00:00:30'])]:
+            table = sprint_table(rows,per_item)
+            self.assertEqual(len(table[0]),len(columns))
+            self.assertEqual(table[0][:1]+table[0][2:],expected[:1]+expected[2:])  # Not the local time.
+            out = io.StringIO()
+            sprint_csv(table,columns,out)
+            lines = out.getvalue().splitlines()
+            self.assertEqual(lines[0],','.join(columns))
+            self.assertEqual(len(lines),len(table)+1)
+            self.assertEqual(lines[1].split(',')[2:],expected[2:])
+
+
+    def test_an_item_the_run_never_reached_has_no_delta(self):
+        self.plan(name='Morning',items=(('One',60),('Two',120)))
+        self.store.sprint_start()
+        self.time = 30
+        self.store.sprint_finish()  # Two is never reached.
+        rows = self.store.sprint_report('2000-01-01','2999-12-31')
+        self.assertEqual([r['state'] for r in rows],['paused','waiting'])
+        self.assertEqual([r[7] for r in sprint_table(rows,True)],['-00:00:30','—'])
+
+    def test_sprints_are_listed_oldest_first_and_read_back_by_id(self):
+        self.plan(name='Morning',items=(('One',60),))
+        first = self.store.sprint()['id']
+        self.store.sprint_start()
+        self.time = 45
+        self.store.sprint_advance()
+        self.plan(name='Afternoon',items=(('Two',120),('Three',180)))
+        second = self.store.sprint()['id']
+        listed = self.store.sprints()
+        self.assertEqual([(s['id'],s['name']) for s in listed],[(first,'Morning'),(second,'Afternoon')])
+        self.assertEqual(self.store.sprint()['id'],second)  # No id means the current one.
+        earlier = self.store.sprint(first)
+        self.assertEqual((earlier['name'],earlier['items'],earlier['planned'],earlier['spent']),
+                         ('Morning',1,60,45))
+        self.assertEqual([i['name'] for i in self.store.sprint_items(first)],['One'])
+        self.assertEqual([i['name'] for i in self.store.sprint_items()],['Two','Three'])
+        self.assertIsNone(self.store.sprint(-1))
+        self.assertEqual(self.store.sprint_items(-1),[])
+
+    def test_reading_an_earlier_sprint_leaves_the_current_one_running(self):
+        self.plan(name='Morning',items=(('One',60),))
+        first = self.store.sprint()['id']
+        self.plan(name='Afternoon',items=(('Two',600),))
+        self.store.sprint_start()
+        self.time = 90
+        self.store.sprint(first)
+        self.store.sprint_items(first)
+        self.store.checkpoint()
+        self.assertEqual(self.store.sprint_items()[0]['elapsed'],90)
+        self.assertIsNotNone(self.store.sprinting)
 
 if __name__ == '__main__':
     unittest.main()

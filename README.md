@@ -52,13 +52,15 @@ For the pressure of a short list run against the clock — reply to emails 5 min
 - **Overtime:** reaching zero does not stop anything. The clock keeps going into the red as `-01:12`, the same way task overruns turn red. You decide when to move on.
 - **The panel** names what is on the clock, how far through the plan you are, and what is next. Each plan row shows its countdown and, once it has run, what it actually took — red when it went over.
 - **Afterwards:** finishing the last item shows where the time went, item by item, planned against actual. **Run again** puts every item back to waiting with clocks at zero, so the same routine can be run tomorrow. **New sprint** sets the plan aside and names a fresh one.
-- **Sprint time is its own.** It is not in the day board, Reports, or Config totals, and sprint items are not tasks or subtasks. Past sprints stay in the database, but only the current one is shown.
+- **Looking back:** **◂** and **▸** beside the name step through every sprint, oldest to newest, with `2/7` showing where you are. An earlier sprint is a record and is read-only: its name, its plan, the entry row, the row controls and every run button are disabled, and the panel shows what the run came to and when it started. **Back to the current sprint** returns, and a new sprint jumps there by itself. The current sprint keeps counting and beeping while you look, and Ctrl+Enter does nothing from history — it would close an item you cannot see.
+- **Sprint reports:** the **Reports** button in Sprint mode opens the sprint's own report over a From/To date range (inclusive, default the last seven days). Two shapes: **one row per item** — Date, Started, Sprint, #, Item, Planned, Actual, Delta, Result — and **one row per run** — Date, Started, Sprint, Items, Done, Skipped, Planned, Actual, Delta. Delta is signed: `+00:01:12` ran over the countdown, `-00:00:30` came in under, `—` means the run never reached that item. A run is dated by the day it *started*, so a sprint begun before midnight keeps that day, and a sprint that was only ever planned is not a run and does not appear. The run in progress is included, counted up to the moment you open it. **Export CSV…** saves exactly the rows and shape on screen (UTF-8, Excel-friendly).
+- **Sprint time is its own.** It is not in the day board, the tracker's Reports, or Config totals, and sprint items are not tasks or subtasks. The two reports never mix: Reports in Tracker mode reads sessions, Reports in Sprint mode reads sprints. Every past sprint is kept and stays readable in the sprint report.
 
 ## Storage and timer behavior
 
 Qt chooses the per-user local app data directory (`QStandardPaths.AppLocalDataLocation`); on Windows this is typically under `%LOCALAPPDATA%\SplitTask\SplitTask`. The database is `tracker.sqlite3`. Settings store window geometry and always-on-top preference separately.
 
-Sprints live in the same database, in their own `sprints` and `sprint_items` tables; nothing there joins to tasks, sessions, or days.
+Sprints live in the same database, in their own `sprints` and `sprint_items` tables; nothing there joins to tasks, sessions, or days, and the sprint report queries read those two tables alone. Nothing is deleted, so a past sprint stays in its report.
 
 Elapsed time uses a monotonic clock rather than counting UI ticks. Both clocks are checkpointed together, and only one of them can be running. Active time is checkpointed every second and on state changes. Closing the app saves and pauses timers. Restart after a crash restores the last checkpoint paused; up to roughly one second since the last successful checkpoint may be lost. Closed-app downtime is never added. Pause before putting the computer to sleep; suspend accounting depends on the OS clock. A lock prevents simultaneous instances using the same database.
 
@@ -71,7 +73,7 @@ Use **Config → Back up database** for a consistent SQLite backup. To restore, 
 python -m unittest discover -s tests -v
 ```
 
-Core tests cover pause/resume/stop, session corrections, daily reports and CSV export, mark done/reopen, schema migration, duplicate task aggregation, one active timer, new sessions, crash recovery, editing/moving history, name collisions, and duration validation. Sprint tests cover the sequence and its handoff, overtime, skipping, plan edits and reordering, run again, restart, and the mutual exclusion between the two clocks. A headless Qt smoke test and layout inspection were run on Linux using PySide6 6.8.3. Windows launcher and executable packaging still need validation on a Windows machine.
+Core tests cover pause/resume/stop, session corrections, daily reports and CSV export, mark done/reopen, schema migration, duplicate task aggregation, one active timer, new sessions, crash recovery, editing/moving history, name collisions, and duration validation. Sprint tests cover the sequence and its handoff, overtime, skipping, plan edits and reordering, run again, restart, the mutual exclusion between the two clocks, and the sprint report with its CSV export. A headless Qt smoke test and layout inspection were run on Linux using PySide6 6.8.3. Windows launcher and executable packaging still need validation on a Windows machine.
 
 Source: `main.py` (UI), `store.py` (database and timing), `tests/test_store.py` (domain tests).
 
