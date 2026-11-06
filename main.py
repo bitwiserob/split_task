@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (
     QComboBox, QDialogButtonBox, QMessageBox, QCheckBox, QTreeWidget,
     QTreeWidgetItem, QInputDialog, QFileDialog, QTableWidget, QTableWidgetItem,
     QHeaderView, QAbstractItemView, QDateEdit, QSplitter, QListWidget,
-    QListWidgetItem, QTextEdit,
+    QListWidgetItem, QTextEdit, QStackedWidget,
 )
 from store import REPORT_COLUMNS, Store, clock, duration, report_csv
 
@@ -33,6 +33,13 @@ QPushButton:hover { background: #364656; }
 QPushButton:disabled { color: #64717e; background: #20262d; border-color: #303640; }
 QPushButton#primary { background: #91e0b2; color: #10251a; border: none; font-weight: 600; }
 QPushButton#primary:disabled { background: #3b4a43; color: #7d8a84; }
+QPushButton#mode { padding: 6px 12px; }
+QPushButton#mode:checked { background: #91e0b2; color: #10251a; border-color: #91e0b2; font-weight: 600; }
+QFrame#runner { background: #1c232c; border: 1px solid #3d4b59; border-radius: 10px; }
+QFrame#item { background: #1c232c; border: 1px solid #303b47; border-radius: 6px; }
+QFrame#runner QLabel,QFrame#item QLabel { background: transparent; }
+QLabel#count { font-family: Consolas, monospace; font-size: 38px; font-weight: 700; }
+QLabel#now { color: #8aa0b4; font-size: 11px; font-weight: 700; letter-spacing: 0.6px; }
 QLineEdit,QComboBox,QDateEdit { background: #10151b; border: 1px solid #435160; border-radius: 4px; padding: 7px; }
 QLineEdit:focus,QComboBox:focus,QDateEdit:focus { border-color: #91e0b2; }
 QScrollArea { border: none; }
@@ -63,6 +70,14 @@ def button(text, callback, tip='', primary=False):
     if primary:
         w.setObjectName('primary')
     return w
+
+
+def countdown(seconds):
+    """The big clock: minutes and seconds, with hours only when there are any."""
+    seconds = max(0, int(seconds))
+    h, rest = divmod(seconds, 3600)
+    m, s = divmod(rest, 60)
+    return f'{h}:{m:02}:{s:02}' if h else f'{m:02}:{s:02}'
 
 
 def numbering(sessions):
@@ -491,6 +506,11 @@ class ConfigDialog(QDialog):
         self.topmost.setChecked(owner.settings.value('topmost',False,type=bool))
         self.topmost.toggled.connect(owner.set_topmost)
         box.addWidget(self.topmost)
+        self.sound = QCheckBox('Beep as a sprint item runs out')
+        self.sound.setChecked(owner.settings.value('sound',True,type=bool))
+        self.sound.setToolTip('One beep at nine tenths of the countdown, two at zero')
+        self.sound.toggled.connect(lambda checked: owner.settings.setValue('sound',checked))
+        box.addWidget(self.sound)
         bottom = QHBoxLayout()
         bottom.addWidget(button('Back up database…',self.backup))
         bottom.addStretch()
@@ -649,6 +669,417 @@ class ReportDialog(QDialog):
                 QMessageBox.warning(self, 'Export failed', str(exc))
 
 
+class SprintItemDialog(QDialog):
+    """Name and countdown for one sprint item."""
+
+    def __init__(self, parent, item):
+        super().__init__(parent)
+        self.setWindowTitle('Sprint item')
+        self.resize(360, 150)
+        box = QVBoxLayout(self)
+        form = QFormLayout()
+        self.name = QLineEdit(item['name'])
+        self.allocated = QLineEdit(clock(item['allocated']))
+        form.addRow('Item', self.name)
+        form.addRow('Countdown', self.allocated)
+        form.addRow(label('Minutes or HH:MM:SS. An item needs more than zero.', 'muted'))
+        box.addLayout(form)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        box.addWidget(buttons)
+
+    def values(self):
+        return self.name.text(), duration(self.allocated.text())
+
+
+class SprintRow(QFrame):
+    """One line of the plan: its place in the order, its countdown, what it took."""
+    GLYPHS = {'waiting': '·', 'running': '▶', 'paused': 'Ⅱ', 'done': '✓', 'skipped': '✕'}
+    COLORS = {'waiting': '#91a1af', 'running': '#91e0b2', 'paused': '#e0c784',
+              'done': '#91e0b2', 'skipped': '#ed7281'}
+    BORDERS = {'running': '#91e0b2', 'paused': '#e0c784'}
+
+    def __init__(self, view, item):
+        super().__init__()
+        self.view, self.item, self.border = view, item, None
+        self.setObjectName('item')
+        self.setToolTip('Double-click to change this item')
+        row = QHBoxLayout(self)
+        row.setContentsMargins(8, 5, 6, 5)
+        row.setSpacing(6)
+        self.glyph = label('')
+        self.glyph.setFixedWidth(14)
+        row.addWidget(self.glyph)
+        self.position = label('', 'muted')
+        self.position.setFixedWidth(16)
+        row.addWidget(self.position)
+        self.title = label('')
+        self.title.setWordWrap(True)
+        row.addWidget(self.title, 1)
+        self.times = label('', 'digits')
+        self.times.setMinimumWidth(150)  # Room for the spent time, so the row never reflows.
+        self.times.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        row.addWidget(self.times)
+        self.controls = []
+        for symbol, tip, action in [
+                ('↑', 'Run this item earlier', lambda checked=False: view.move(self.item, -1)),
+                ('↓', 'Run this item later', lambda checked=False: view.move(self.item, 1)),
+                ('✎', 'Change its name or countdown', lambda checked=False: view.edit(self.item)),
+                ('✕', 'Take it out of the plan', lambda checked=False: view.remove(self.item))]:
+            control = button(symbol, action, tip)
+            control.setFixedSize(22, 22)
+            control.setStyleSheet('QPushButton { padding: 0; }')
+            self.controls.append(control)
+            row.addWidget(control)
+
+    def mouseDoubleClickEvent(self, event):
+        if self.item['state'] not in ('done', 'skipped'):
+            self.view.edit(self.item)
+
+    def refresh(self, item, number):
+        self.item = item
+        state, closed = item['state'], item['state'] in ('done', 'skipped')
+        self.glyph.setText(self.GLYPHS[state])
+        self.glyph.setStyleSheet(f'color: {self.COLORS[state]};')
+        self.position.setText(str(number))
+        self.title.setText(item['name'])
+        self.title.setStyleSheet(f"color: {'#8696a4' if closed else '#e9eef3'};")
+        spent = f" → {clock(item['elapsed'])}" if item['elapsed'] >= 1 else ''
+        self.times.setText(clock(item['allocated']) + spent)
+        over = item['elapsed'] > item['allocated']
+        self.times.setStyleSheet(f"color: {'#ff8792' if over else '#91a1af' if state == 'waiting' else '#91e0b2'};")
+        for control in self.controls:
+            control.setEnabled(not closed)  # The time an item took is not rewritten here.
+        border = self.BORDERS.get(state, '#303b47')
+        if border != self.border:  # Restyling repolishes the row, so only on a change.
+            self.border = border
+            self.setStyleSheet('QFrame#item { border-color: %s; }' % border)
+
+
+class SprintView(QWidget):
+    """Sprint mode: one named stretch of work, split into countdowns that run back to
+    back. Completing an item starts the next one on the spot — that handoff is the
+    point. Sprint time is its own; it never reaches tasks, days or reports."""
+
+    def __init__(self, owner):
+        super().__init__()
+        self.owner, self.store = owner, owner.store
+        self.rows, self.order, self.held = {}, [], None
+        self.alerted = [None, 0]  # The item last alerted for, and how far it had got.
+        box = QVBoxLayout(self)
+        box.setContentsMargins(0, 0, 0, 0)
+        box.setSpacing(8)
+        head = QHBoxLayout()
+        head.setSpacing(6)
+        head.addWidget(label('SPRINT', 'group'))
+        self.name = QLineEdit()
+        self.name.setPlaceholderText('Work, small tasks, morning routine…')
+        self.name.setToolTip('What this stretch of work is called')
+        self.name.editingFinished.connect(self.rename)
+        head.addWidget(self.name, 1)
+        head.addWidget(button('New sprint', self.start_new, 'Set this plan aside and name a fresh sprint'))
+        box.addLayout(head)
+        box.addWidget(self.runner())
+        box.addWidget(label('PLAN', 'group'))
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        content = QWidget()
+        self.plan = QVBoxLayout(content)
+        self.plan.setContentsMargins(0, 0, 0, 0)
+        self.plan.setSpacing(5)
+        self.empty = label('Nothing in this sprint yet.\nAdd what you are going to do and how long each piece gets.', 'muted')
+        self.empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.plan.addWidget(self.empty)
+        self.plan.addStretch()
+        scroll.setWidget(content)
+        box.addWidget(scroll, 1)
+        entry = QHBoxLayout()
+        entry.setSpacing(6)
+        self.item_name = QLineEdit()
+        self.item_name.setPlaceholderText('Reply to emails')
+        self.item_name.returnPressed.connect(self.add)
+        self.item_time = QLineEdit('5')
+        self.item_time.setPlaceholderText('5')
+        self.item_time.setFixedWidth(70)
+        self.item_time.setToolTip('Minutes, or HH:MM:SS')
+        self.item_time.returnPressed.connect(self.add)
+        entry.addWidget(self.item_name, 1)
+        entry.addWidget(self.item_time)
+        entry.addWidget(button('Add', self.add, 'Put this item at the end of the plan'))
+        box.addLayout(entry)
+        self.status = label('', 'muted')
+        self.status.setWordWrap(True)
+        box.addWidget(self.status)
+
+    def runner(self):
+        """The panel that carries the pressure: what is on the clock and what is left."""
+        panel = QFrame()
+        panel.setObjectName('runner')
+        self.panel, self.border = panel, None
+        box = QVBoxLayout(panel)
+        box.setContentsMargins(14, 10, 14, 12)
+        box.setSpacing(2)
+        self.heading = label('', 'now')
+        box.addWidget(self.heading)
+        self.current = label('', 'taskName')
+        self.current.setWordWrap(True)
+        box.addWidget(self.current)
+        self.count = label('00:00', 'count')
+        box.addWidget(self.count)
+        self.next = label('', 'muted')
+        self.next.setWordWrap(True)
+        box.addWidget(self.next)
+        bar = QHBoxLayout()
+        bar.setSpacing(6)
+        self.go = button('Start sprint', self.start, 'Put the first item on the clock', True)
+        self.complete = button('Complete  ▸', self.finish_item,
+                               'Done — close this item and start the next one (Ctrl+Enter)', True)
+        self.pause = button('Pause', self.hold, 'Hold the countdown where it is')
+        self.skip = button('Skip', self.skip_item, 'Leave this item and move to the next one')
+        self.stop = button('Finish run', self.stop_run, 'End the run and see where the time went')
+        self.again = button('Run again', self.reset, 'Put every item back to waiting, clocks at zero')
+        for control in (self.go, self.complete, self.pause, self.skip, self.stop, self.again):
+            bar.addWidget(control)
+        bar.addStretch()
+        box.addSpacing(6)
+        box.addLayout(bar)
+        return panel
+
+    # Reading the plan.
+
+    def refresh(self):
+        sprint = self.store.sprint()
+        items = self.store.sprint_items() if sprint else []
+        current = self.store.sprint_current() if sprint else None
+        finished = sprint is not None and sprint['ended'] is not None
+        underway = sprint is not None and sprint['started'] is not None and not finished
+        state = current['state'] if current else None
+        ticking = state == 'running'
+        if sprint and not self.name.hasFocus() and self.name.text() != sprint['name']:
+            self.name.setText(sprint['name'])  # Never overwrite a name being typed.
+        self.empty.setVisible(not items)
+        ids = [i['id'] for i in items]
+        if ids != self.order:  # The plan changed shape: rebuild it in run order.
+            for row in self.rows.values():
+                self.plan.removeWidget(row)
+                row.setParent(None)
+                row.deleteLater()
+            self.rows, self.order = {}, ids
+            for item in items:
+                self.rows[item['id']] = row = SprintRow(self, item)
+                self.plan.insertWidget(self.plan.count()-1, row)
+        for number, item in enumerate(items, 1):
+            self.rows[item['id']].refresh(item, number)
+        self.refresh_runner(sprint, items, current, state, ticking, underway, finished)
+
+    def refresh_runner(self, sprint, items, current, state, ticking, underway, finished):
+        done = sum(1 for i in items if i['state'] in ('done', 'skipped'))
+        if sprint is None:
+            self.heading.setText('NO SPRINT YET')
+            self.current.setText('Name it above')
+            self.next.setText('A sprint is a stretch of work — "Work", "Small tasks" — split into timed items.')
+        elif current is None:
+            self.heading.setText('RUN FINISHED' if items else 'EMPTY PLAN')
+            self.current.setText(sprint['name'] if items else 'Nothing to run')
+            self.next.setText(f"{sprint['items_done']} done, {sprint['items_skipped']} skipped."
+                              if items else 'Add the first item below.')
+        else:
+            position = f"ITEM {done+1} OF {len(items)}"
+            self.heading.setText(f'NOW · {position}' if underway else f'NEXT UP · {position}')
+            self.current.setText(current['name'])
+            waiting = [i for i in items if i['state'] == 'waiting' and i['id'] != current['id']]
+            self.next.setText(f"NEXT · {waiting[0]['name']} · {clock(waiting[0]['allocated'])}"
+                              if waiting else 'Last item in the plan.')
+        over = current is not None and current['remaining'] < 0
+        if current is not None:  # A countdown, and below zero it keeps going in the red.
+            self.count.setText(('-' if over else '') + countdown(abs(current['remaining'])))
+        else:
+            self.count.setText(countdown(sprint['spent']) if sprint and items else '00:00')
+        self.count.setStyleSheet(f"color: {'#ff8792' if over else '#e9eef3' if ticking else '#91a1af'};")
+        border = '#ff8792' if over else '#91e0b2' if ticking else '#3d4b59'
+        if border != self.border:  # Restyling repolishes the panel, so only on a change.
+            self.border = border
+            self.panel.setStyleSheet('QFrame#runner { border-color: %s; }' % border)
+        self.go.setText('Continue' if finished else 'Resume' if state == 'paused' else 'Start sprint')
+        self.go.setVisible(current is not None and not ticking)
+        self.complete.setVisible(ticking)
+        self.pause.setVisible(ticking)
+        self.skip.setVisible(underway and current is not None)
+        self.stop.setVisible(underway)
+        self.again.setVisible(not underway and bool(sprint and sprint['spent']))
+        if not ticking:
+            self.held = None  # The tracked task is only on hold while a sprint counts.
+        self.status.setText(self.line(sprint, items, done))
+
+    def line(self, sprint, items, done):
+        if sprint is None or not items:
+            return 'Items run one after another: finish one and the next starts counting down straight away.'
+        delta = round(sprint['spent'] - sprint['planned'])
+        text = (f"{done} of {len(items)} closed · planned {clock(sprint['planned'])}"
+                f" · spent {clock(sprint['spent'])}"
+                + (f" · {clock(abs(delta))} {'over' if delta > 0 else 'under'}"
+                   if delta and sprint['spent'] else ''))
+        if self.held:
+            text += f" · paused the task “{self.held}” — one clock at a time"
+        return text
+
+    # Changing the plan.
+
+    def rename(self):
+        """The name field doubles as the way to start a first sprint."""
+        sprint, text = self.store.sprint(), self.name.text().strip()
+        if not text or (sprint is not None and text == sprint['name']):
+            return
+        try:
+            self.store.rename_sprint(text) if sprint else self.store.new_sprint(text)
+        except ValueError as exc:
+            QMessageBox.warning(self, 'Check the sprint', str(exc))
+        self.owner.refresh()
+
+    def start_new(self):
+        sprint = self.store.sprint()
+        if sprint and sprint['items'] and QMessageBox.question(
+                self, 'New sprint',
+                f"Set “{sprint['name']}” aside and start a new sprint?\n\n"
+                f"It keeps its {sprint['items']} item(s) and {clock(sprint['spent'])} in the database, "
+                f"but the view follows the new sprint. Use Run again instead to repeat this one."
+                ) != QMessageBox.StandardButton.Yes:
+            return
+        text, ok = QInputDialog.getText(self, 'New sprint', 'Name this stretch of work')
+        if not ok:
+            return
+        try:
+            self.store.new_sprint(text)
+            self.held, self.alerted = None, [None, 0]
+            self.name.setText(text.strip())
+            self.item_name.setFocus()
+        except ValueError as exc:
+            QMessageBox.warning(self, 'Check the sprint', str(exc))
+        self.owner.refresh()
+
+    def add(self):
+        try:
+            if self.store.sprint() is None:  # Naming the sprint is enough to start planning.
+                self.store.new_sprint(self.name.text())
+            self.store.add_sprint_item(self.item_name.text(), duration(self.item_time.text()))
+            self.item_name.clear()
+            self.item_name.setFocus()  # The next item is usually typed right away.
+        except (ValueError, sqlite3.Error) as exc:
+            QMessageBox.warning(self, 'Check the item', str(exc))
+        self.owner.refresh()
+
+    def edit(self, item):
+        dialog = SprintItemDialog(self, item)
+        while dialog.exec():
+            try:
+                name, allocated = dialog.values()
+                self.store.edit_sprint_item(item['id'], name, allocated)
+                break
+            except ValueError as exc:
+                QMessageBox.warning(self, 'Check the item', str(exc))
+        self.owner.refresh()
+
+    def remove(self, item):
+        if item['elapsed'] >= 1 and QMessageBox.question(
+                self, 'Remove item', f"Take “{item['name']}” out of the plan?\n\n"
+                f"Its {clock(item['elapsed'])} goes with it.") != QMessageBox.StandardButton.Yes:
+            return
+        self.store.delete_sprint_item(item['id'])
+        self.owner.refresh()
+
+    def move(self, item, delta):
+        self.store.move_sprint_item(item['id'], delta)
+        self.owner.refresh()
+
+    # Running it.
+
+    def start(self):
+        self.held = self.store.running()  # Named in the status line, since it stops counting.
+        self.store.sprint_start()
+        self.owner.refresh()
+
+    def hold(self):
+        self.store.sprint_pause()
+        self.owner.refresh()
+
+    def finish_item(self):
+        self.advance('done')
+
+    def skip_item(self):
+        self.advance('skipped')
+
+    def advance(self, state):
+        """Close the item on the clock; the next one starts counting immediately."""
+        if self.store.sprint_current() is None:
+            return
+        if self.store.sprint_advance(state) is None:
+            self.report()  # That was the last one.
+        self.owner.refresh()
+
+    def stop_run(self):
+        self.store.sprint_finish()
+        self.report()
+        self.owner.refresh()
+
+    def reset(self):
+        sprint = self.store.sprint()
+        if sprint and sprint['spent'] and QMessageBox.question(
+                self, 'Run again', f"Put every item of “{sprint['name']}” back to waiting?\n\n"
+                f"The {clock(sprint['spent'])} this run took is cleared."
+                ) != QMessageBox.StandardButton.Yes:
+            return
+        self.store.sprint_reset()
+        self.held, self.alerted = None, [None, 0]
+        self.owner.refresh()
+
+    def alert(self):
+        """One beep at nine tenths of an item's countdown, two when it reaches zero.
+        Each fires once per item: the level only rises as the item runs, and a reset or
+        a corrected countdown drops it back and re-arms the beeps."""
+        item = self.store.sprint_current() if self.store.sprinting is not None else None
+        if item is None or item['state'] != 'running':
+            return
+        if self.alerted[0] != item['id']:
+            self.alerted = [item['id'], 0]
+        share = item['elapsed'] / item['allocated']  # An item always has a countdown.
+        level = 2 if share >= 1 else 1 if share >= 0.9 else 0
+        previous, self.alerted[1] = self.alerted[1], level
+        if level > previous and self.owner.settings.value('sound', True, type=bool):
+            self.beep(level)  # Both crossed in one tick: only the louder one sounds.
+
+    def beep(self, times):
+        QApplication.beep()
+        for n in range(1, times):  # A second beep, far enough apart to be heard as two.
+            QTimer.singleShot(180*n, QApplication.beep)
+
+    def hotkey(self):
+        """Ctrl+Enter completes the item on the clock, without reaching for the mouse."""
+        if self.isVisible() and self.store.sprinting is not None:
+            self.advance('done')
+
+    def report(self):
+        """Where the run's time went, item by item."""
+        sprint, items = self.store.sprint(), self.store.sprint_items()
+        if sprint is None or not items:
+            return
+        lines = []
+        for item in items:
+            delta = round(item['elapsed'] - item['allocated'])
+            lines.append(f"{SprintRow.GLYPHS[item['state']]} {item['name']} — "
+                         f"{clock(item['allocated'])} → {clock(item['elapsed'])}"
+                         + (f" ({'+' if delta > 0 else '-'}{clock(abs(delta))})" if delta else ''))
+        delta = round(sprint['spent'] - sprint['planned'])
+        QMessageBox.information(self, 'Sprint finished',
+            f"{sprint['name']} — {sprint['items_done']} done"
+            + (f", {sprint['items_skipped']} skipped" if sprint['items_skipped'] else '')
+            + (f", {sprint['items_waiting']} never run" if sprint['items_waiting'] else '')
+            + '\n\n' + '\n'.join(lines)
+            + f"\n\nPlanned {clock(sprint['planned'])} · spent {clock(sprint['spent'])}"
+            + (f" · {clock(abs(delta))} {'over' if delta > 0 else 'under'}" if delta else '')
+            + '\n\nSprint time stays here: it is not in the day board or the reports.')
+
+
 class MainWindow(QMainWindow):
     def __init__(self, store):
         super().__init__()
@@ -670,7 +1101,21 @@ class MainWindow(QMainWindow):
         head.addWidget(label('Split Task','brand'))
         head.addStretch()
         head.addWidget(label('MAKE TIME VISIBLE','muted'))
+        self.modes = {}
+        for key, text, tip in [('tracker','Tracker','Sessions, budgets and the day board'),
+                               ('sprint','Sprint','Timed items run back to back (Ctrl+Shift+S)')]:
+            control = button(text,lambda checked=False,k=key: self.set_mode(k),tip)
+            control.setObjectName('mode')
+            control.setCheckable(True)
+            self.modes[key] = control
+            head.addWidget(control)
         box.addLayout(head)
+        self.stack = QStackedWidget()
+        box.addWidget(self.stack,1)
+        tracker = QWidget()
+        page = QVBoxLayout(tracker)
+        page.setContentsMargins(0,0,0,0)
+        self.stack.addWidget(tracker)
         subtitle = QHBoxLayout()
         subtitle.addWidget(label('One task at a time. Every session counts.','muted'),1)
         self.picker = QComboBox()
@@ -678,7 +1123,7 @@ class MainWindow(QMainWindow):
         self.picker.setToolTip('Revisit a day. Closed days are read-only.')
         self.picker.currentIndexChanged.connect(self.pick_day)
         subtitle.addWidget(self.picker)
-        box.addLayout(subtitle)
+        page.addLayout(subtitle)
         self.banner = QFrame()
         self.banner.setObjectName('banner')
         banner = QHBoxLayout(self.banner)
@@ -687,7 +1132,7 @@ class MainWindow(QMainWindow):
         self.banner_text.setWordWrap(True)
         banner.addWidget(self.banner_text,1)
         banner.addWidget(button('Back to the open day',self.back_to_today,'Return to the day you are tracking into'))
-        box.addWidget(self.banner)
+        page.addWidget(self.banner)
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         content = QWidget()
@@ -710,9 +1155,9 @@ class MainWindow(QMainWindow):
         self.list.addWidget(self.done)
         self.list.addStretch()
         self.scroll.setWidget(content)
-        box.addWidget(self.scroll,1)
+        page.addWidget(self.scroll,1)
         self.summary = label('','muted')
-        box.addWidget(self.summary)
+        page.addWidget(self.summary)
         bottom = QHBoxLayout()
         self.quick = button('+  Quick add',self.quick_add,'Add a task and session',True)
         self.inline_button = button('Inline',self.inline_add,'Add an editable row (Shift+A)')
@@ -722,9 +1167,16 @@ class MainWindow(QMainWindow):
         bottom.addStretch()
         bottom.addWidget(button('Reports',self.reports,'Daily tracked time per task, with CSV export'))
         bottom.addWidget(button('⚙  Config',self.config,'Manage projects, totals, and settings'))
-        box.addLayout(bottom)
+        page.addLayout(bottom)
+        self.sprint_view = SprintView(self)
+        self.stack.addWidget(self.sprint_view)
         self.shortcut = QShortcut(QKeySequence('Shift+A'),self)
         self.shortcut.activated.connect(self.inline_add)
+        self.switch = QShortcut(QKeySequence('Ctrl+Shift+S'),self)
+        self.switch.activated.connect(lambda: self.set_mode(
+            'tracker' if self.stack.currentWidget() is self.sprint_view else 'sprint'))
+        self.handoff = QShortcut(QKeySequence('Ctrl+Return'),self)
+        self.handoff.activated.connect(self.sprint_view.hotkey)
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.tick)
         self.timer.start(1000)
@@ -732,6 +1184,15 @@ class MainWindow(QMainWindow):
         if geometry:
             self.restoreGeometry(geometry)
         self.set_topmost(self.settings.value('topmost',False,type=bool))
+        self.set_mode(self.settings.value('mode','tracker',type=str))
+
+    def set_mode(self, mode):
+        """Tracker and Sprint are two views over one clock: only one of them counts."""
+        mode = mode if mode in self.modes else 'tracker'
+        self.settings.setValue('mode',mode)
+        for key, control in self.modes.items():
+            control.setChecked(key == mode)
+        self.stack.setCurrentWidget(self.sprint_view if mode == 'sprint' else self.stack.widget(0))
         self.refresh()
 
     def set_topmost(self, checked):
@@ -741,9 +1202,16 @@ class MainWindow(QMainWindow):
 
     def tick(self):
         self.store.checkpoint()
+        self.sprint_view.alert()  # The countdown is heard from either mode.
         self.refresh()
 
     def refresh(self):
+        if self.stack.currentWidget() is self.sprint_view:
+            self.sprint_view.refresh()
+        else:
+            self.refresh_tracker()
+
+    def refresh_tracker(self):
         days = self.populate_days()
         live = self.viewing is None
         day = next((d for d in days if d['id'] == (self.store.day if live else self.viewing)), None)
@@ -800,10 +1268,12 @@ class MainWindow(QMainWindow):
         self.done_toggle.setVisible(bool(done))
         self.done.setVisible(bool(done) and expanded)
         running = self.store.running()
+        sprinting = self.store.sprint_current() if self.store.sprinting is not None else None
         self.summary.setText(f"Day {self.day_names.get(day['id'],day['label'])}" + ('' if live else ' · closed') +
                              f" · {len(active)} tasks" + (f" · {len(done)} done" if done else '') +
                              f" · {clock(sum(t['total'] for t in tasks))} tracked" +
-                             (f' · {running} running' if running else ' · Timers idle'))
+                             (f' · {running} running' if running else
+                              f" · sprint: {sprinting['name']}" if sprinting else ' · Timers idle'))
 
     def new_day(self):
         if self.viewing:

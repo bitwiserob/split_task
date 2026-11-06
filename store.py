@@ -3,6 +3,11 @@
 A day is an explicit row, opened by New day rather than by the clock, and every
 session belongs to one. Day totals are what the board shows; nothing is erased,
 so any past day can still be read back per task.
+
+Sprint mode is the other clock: a named sprint holds items that count down one
+after another, kept apart from tasks, sessions and days so it never touches the
+board or the reports. Both clocks share checkpoint(), and only one of them may
+run at a time.
 """
 import csv
 import sqlite3
@@ -54,6 +59,7 @@ class Store:
     def __init__(self, path, now=time.monotonic):
         self.now = now
         self.active = None
+        self.sprinting = None  # The sprint item counting down, when a sprint is running.
         self.last = now()
         self.db = sqlite3.connect(str(path))
         self.db.row_factory = sqlite3.Row
@@ -82,7 +88,20 @@ class Store:
           name TEXT NOT NULL, done INTEGER NOT NULL DEFAULT 0,
           created TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')));
         CREATE INDEX IF NOT EXISTS subtasks_task ON subtasks(task_id);
+        CREATE TABLE IF NOT EXISTS sprints(
+          id INTEGER PRIMARY KEY, name TEXT NOT NULL,
+          created TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+          started TEXT, ended TEXT);
+        CREATE TABLE IF NOT EXISTS sprint_items(
+          id INTEGER PRIMARY KEY,
+          sprint_id INTEGER NOT NULL REFERENCES sprints(id) ON DELETE CASCADE,
+          name TEXT NOT NULL, allocated INTEGER NOT NULL CHECK(allocated>0),
+          elapsed REAL NOT NULL DEFAULT 0, position INTEGER NOT NULL,
+          state TEXT NOT NULL DEFAULT 'waiting'
+            CHECK(state IN ('waiting','running','paused','done','skipped')));
+        CREATE INDEX IF NOT EXISTS sprint_items_sprint ON sprint_items(sprint_id,position);
         UPDATE sessions SET state='paused' WHERE state='running';
+        UPDATE sprint_items SET state='paused' WHERE state='running';
         INSERT OR IGNORE INTO categories(name) VALUES ('Main');
         ''')
         if 'done' not in {r['name'] for r in self.db.execute('PRAGMA table_info(tasks)')}:
@@ -172,10 +191,16 @@ class Store:
         return tid
 
     def checkpoint(self):
+        """Bank the time since the last checkpoint. Only one of the two clocks can be
+        running, so they share `last` and are written in the same transaction."""
         now = self.now()
-        if self.active is not None:
+        delta = max(0, now - self.last)
+        if self.active is not None or self.sprinting is not None:
             with self.db:
-                self.db.execute('UPDATE sessions SET elapsed=elapsed+? WHERE id=?', (max(0, now-self.last), self.active))
+                if self.active is not None:
+                    self.db.execute('UPDATE sessions SET elapsed=elapsed+? WHERE id=?', (delta, self.active))
+                if self.sprinting is not None:
+                    self.db.execute('UPDATE sprint_items SET elapsed=elapsed+? WHERE id=?', (delta, self.sprinting))
         self.last = now
 
     def transition(self, sid, state):
@@ -186,7 +211,8 @@ class Store:
         with self.db:
             if state == 'running':
                 self.db.execute("UPDATE sessions SET state='paused' WHERE state='running'")
-                self.active = sid
+                self.db.execute("UPDATE sprint_items SET state='paused' WHERE state='running'")
+                self.active, self.sprinting = sid, None
             elif self.active == sid:
                 self.active = None
             self.db.execute('UPDATE sessions SET state=? WHERE id=?', (state, sid))
@@ -326,9 +352,157 @@ class Store:
         with self.db:
             self.db.execute(f'DELETE FROM {kind} WHERE id=?', (ident,))
 
+    # Sprint mode. A sprint is a named stretch of work split into timed items that run
+    # back to back: finishing one starts the next on the spot. Items are not tasks and
+    # carry no day, so nothing here reaches tasks(), totals() or report().
+
+    def sprint(self):
+        """The current sprint — the newest one — with its planned and spent totals.
+        None until the first sprint is created; past sprints are kept, not erased."""
+        return self.db.execute('''SELECT s.*,
+          (SELECT COUNT(*) FROM sprint_items WHERE sprint_id=s.id) items,
+          (SELECT COUNT(*) FROM sprint_items WHERE sprint_id=s.id AND state='done') items_done,
+          (SELECT COUNT(*) FROM sprint_items WHERE sprint_id=s.id AND state='skipped') items_skipped,
+          (SELECT COUNT(*) FROM sprint_items WHERE sprint_id=s.id AND state='waiting') items_waiting,
+          (SELECT COALESCE(SUM(allocated),0) FROM sprint_items WHERE sprint_id=s.id) planned,
+          (SELECT COALESCE(SUM(elapsed),0) FROM sprint_items WHERE sprint_id=s.id) spent
+          FROM sprints s WHERE s.id=(SELECT MAX(id) FROM sprints)''').fetchone()
+
+    def new_sprint(self, name):
+        """Put the current sprint aside and start planning a fresh one."""
+        if not name.strip():
+            raise ValueError('Name the sprint, for example Work or Small tasks.')
+        self.sprint_pause()
+        with self.db:
+            return self.db.execute('INSERT INTO sprints(name) VALUES (?)', (name.strip(),)).lastrowid
+
+    def rename_sprint(self, name):
+        if not name.strip():
+            raise ValueError('Name the sprint, for example Work or Small tasks.')
+        with self.db:
+            self.db.execute('UPDATE sprints SET name=? WHERE id=(SELECT MAX(id) FROM sprints)', (name.strip(),))
+
+    def sprint_items(self):
+        """The current sprint's items in run order, with the time each has left."""
+        return self.db.execute('''SELECT *,allocated-elapsed remaining FROM sprint_items
+            WHERE sprint_id=(SELECT MAX(id) FROM sprints) ORDER BY position,id''').fetchall()
+
+    def add_sprint_item(self, name, allocated):
+        """Append an item to the plan. An item is a countdown, so zero is not allowed."""
+        if not name.strip():
+            raise ValueError('Give the item a name.')
+        if allocated <= 0:
+            raise ValueError('Give the item a countdown longer than zero.')
+        sprint = self.sprint()
+        if sprint is None:
+            raise ValueError('Name the sprint first.')
+        with self.db:
+            position = self.db.execute('SELECT COALESCE(MAX(position),0)+1 FROM sprint_items WHERE sprint_id=?',
+                                       (sprint['id'],)).fetchone()[0]
+            return self.db.execute('INSERT INTO sprint_items(sprint_id,name,allocated,position) VALUES (?,?,?,?)',
+                                   (sprint['id'], name.strip(), allocated, position)).lastrowid
+
+    def edit_sprint_item(self, item_id, name=None, allocated=None):
+        """Correct an item's name or countdown; the time it has spent is untouched."""
+        if name is not None and not name.strip():
+            raise ValueError('Give the item a name.')
+        if allocated is not None and allocated <= 0:
+            raise ValueError('Give the item a countdown longer than zero.')
+        with self.db:
+            if name is not None:
+                self.db.execute('UPDATE sprint_items SET name=? WHERE id=?', (name.strip(), item_id))
+            if allocated is not None:
+                self.db.execute('UPDATE sprint_items SET allocated=? WHERE id=?', (allocated, item_id))
+
+    def delete_sprint_item(self, item_id):
+        """Drop an item from the plan; the item on the clock stops counting with it."""
+        self.checkpoint()
+        if self.sprinting == item_id:
+            self.sprinting = None
+        with self.db:
+            self.db.execute('DELETE FROM sprint_items WHERE id=?', (item_id,))
+
+    def move_sprint_item(self, item_id, delta):
+        """Swap an item with its neighbour, changing the order the countdowns run in."""
+        items = self.sprint_items()
+        index = next((n for n, i in enumerate(items) if i['id'] == item_id), None)
+        if index is None or not 0 <= index + delta < len(items):
+            return
+        order = [i['id'] for i in items]
+        order[index], order[index + delta] = order[index + delta], order[index]
+        with self.db:  # Imported or deleted rows can leave gaps, so renumber the plan.
+            for position, ident in enumerate(order, 1):
+                self.db.execute('UPDATE sprint_items SET position=? WHERE id=?', (position, ident))
+
+    def sprint_current(self):
+        """The item on the clock — running or paused — else the next one waiting."""
+        return self.db.execute('''SELECT *,allocated-elapsed remaining FROM sprint_items
+            WHERE sprint_id=(SELECT MAX(id) FROM sprints) AND state IN ('running','paused','waiting')
+            ORDER BY state='waiting',position,id LIMIT 1''').fetchone()
+
+    def sprint_start(self):
+        """Put the current item on the clock, resuming it or starting the next one waiting.
+        A running session pauses: one clock at a time. Returns the item, or None when the
+        plan has nothing left to run, which ends the run."""
+        self.checkpoint()
+        item = self.sprint_current()
+        if item is None:
+            self.sprint_finish()
+            return None
+        with self.db:
+            self.db.execute("UPDATE sessions SET state='paused' WHERE state='running'")
+            self.db.execute("UPDATE sprint_items SET state='running' WHERE id=?", (item['id'],))
+            self.db.execute('''UPDATE sprints SET started=COALESCE(started,strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+                ended=NULL WHERE id=?''', (item['sprint_id'],))
+        self.active, self.sprinting = None, item['id']
+        return item
+
+    def sprint_pause(self):
+        """Hold the countdown where it is. The item keeps its place in the plan."""
+        self.checkpoint()
+        with self.db:
+            self.db.execute("UPDATE sprint_items SET state='paused' WHERE state='running'")
+        self.sprinting = None
+
+    def sprint_advance(self, state='done'):
+        """Close the item on the clock and start the next one straight away — the handoff
+        this mode exists for. Returns the item now counting down, or None when the plan is
+        finished. Overtime is kept: an item's spent time is whatever it took."""
+        if state not in ('done', 'skipped'):
+            raise ValueError('An item is either done or skipped.')
+        self.checkpoint()
+        item = self.sprint_current()
+        if item is None:
+            return None
+        with self.db:
+            self.db.execute('UPDATE sprint_items SET state=? WHERE id=?', (state, item['id']))
+        if self.sprinting == item['id']:
+            self.sprinting = None
+        return self.sprint_start()
+
+    def sprint_finish(self):
+        """End the run and stop the clock. Items left waiting stay in the plan, unrun."""
+        self.checkpoint()
+        with self.db:
+            self.db.execute("UPDATE sprint_items SET state='paused' WHERE state='running'")
+            self.db.execute('''UPDATE sprints SET ended=strftime('%Y-%m-%dT%H:%M:%SZ','now')
+                WHERE id=(SELECT MAX(id) FROM sprints)''')
+        self.sprinting = None
+
+    def sprint_reset(self):
+        """Put the plan back on the start line: every item waiting, every clock at zero,
+        so the same routine can be run again."""
+        self.checkpoint()
+        self.sprinting = None
+        with self.db:
+            sprint = self.db.execute('SELECT MAX(id) FROM sprints').fetchone()[0]
+            self.db.execute("UPDATE sprint_items SET state='waiting',elapsed=0 WHERE sprint_id=?", (sprint,))
+            self.db.execute('UPDATE sprints SET started=NULL,ended=NULL WHERE id=?', (sprint,))
+
     def close(self):
         self.checkpoint()
         with self.db:
             self.db.execute("UPDATE sessions SET state='paused' WHERE state='running'")
-        self.active = None
+            self.db.execute("UPDATE sprint_items SET state='paused' WHERE state='running'")
+        self.active = self.sprinting = None
         self.db.close()
